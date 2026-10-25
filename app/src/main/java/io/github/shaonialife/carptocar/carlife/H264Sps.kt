@@ -121,7 +121,7 @@ internal object H264Sps {
     private fun parseRbsp(rbsp: ByteArray): Pair<Int, Int> {
         val r = BitReader(rbsp)
         val profileIdc = r.u(8)
-        r.u(16) // constraint_set flags + reserved
+        r.u(8) // constraint_set0..5 + reserved（8 位，多读一位会让后面全部错位）
         r.u(8) // level_idc
         r.ue() // seq_parameter_set_id
 
