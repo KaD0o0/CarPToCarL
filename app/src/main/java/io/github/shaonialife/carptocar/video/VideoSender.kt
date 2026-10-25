@@ -63,7 +63,29 @@ class VideoSender(
 ) {
     private val width: Int = (width / 2) * 2
     private val height: Int = (height / 2) * 2
+    @Volatile
     private var socket: Socket? = null
+
+    /** 正在重连数据口：保活线程据此跳过写入，避免抢在 socket 置空窗口期抛错自杀。 */
+    @Volatile
+    private var reconnecting = false
+
+    /**
+     * 视频数据口的**唯一写锁**。
+     *
+     * 直通模式下有两条线程会往同一个 socket 写字节：CarLife 帧线程（[submitH264]）
+     * 和屏保活线程（[passthroughKeepAliveLoop]：keepAlive + 空闲重发 IDR）。
+     * 不加锁时两边的 `write(header)` / `write(body)` 会交错，接收端拿到的就是一帧
+     * 半 A 半 B 的乱码 —— ChaCha20-Poly1305 的 tag 校验必然失败。
+     *
+     * WinPlay 1.2.4 实测（2026-10-25）：`视频帧认证失败 → 视频通道正在重新连接 →
+     * 8s 后 视频通道恢复超时 → 整轮会话关闭`，几乎每次都紧跟在空闲重发之后
+     * （如 18:24:58.887 重发 IDR → 18:24:58.912 Connection reset）。
+     *
+     * 锁的范围必须包含「构造头 + 加密 + 写字节 + frameCounter 自增」：
+     * 只锁写字节仍会让加密时的计数器与落地顺序错位，接收端按到达顺序解密同样失败。
+     */
+    private val writeLock = Any()
     private var encoder: MediaCodec? = null
     private var inputSurface: Surface? = null
     private val running = AtomicBoolean(false)
@@ -135,6 +157,55 @@ class VideoSender(
         } catch (error: Exception) {
             log("VIDEO: 数据端口连接失败 - ${error.message}")
             false
+        }
+    }
+
+    /**
+     * 视频通道被接收端重置后重新拉起数据端口。
+     *
+     * 接收端的处理流程是「检测到解密失败 → 丢掉旧通道 → 重新监听同一端口 →
+     * 等手机连回来新通道（8s 内）→ 超时就关掉整轮会话」
+     * （WinPlay 1.2.4 日志：`视频帧认证失败 → 视频通道正在重新连接 → 视频通道恢复超时`）。
+     * 旧实现收到 reset 直接 [stop]，等于放弃这 8 秒窗口，于是每次解密失败都升级成
+     * 「整轮会话断开、要重新点启动连接」。
+     *
+     * 新通道视作新流：接收端会重建解密状态，计数器从 0 起算（AirPlay 视频帧的 AEAD
+     * nonce 不随包传输，双方只能各自按「本流第几帧」推算），所以这里必须把
+     * [frameCounter] 归零并重发 VideoConfig，否则重连后每一帧都会校验失败。
+     */
+    private fun reconnectDataPort(): Boolean {
+        reconnecting = true
+        try {
+            runCatching { socket?.close() }
+            socket = null
+            synchronized(writeLock) {
+                configSent = false
+                frameCounter = 0L
+                lastIdrNals = null
+            }
+            var attempt = 0
+            while (running.get() && attempt < DATA_RECONNECT_ATTEMPTS) {
+                attempt++
+                try {
+                    val client = Socket()
+                    client.connect(InetSocketAddress(host, dataPort), 2_000)
+                    client.tcpNoDelay = true
+                    socket = client
+                    log("VIDEO: 视频通道已重连（第 $attempt 次）——重发 VideoConfig，等下一个 IDR")
+                    return true
+                } catch (error: Exception) {
+                    log("VIDEO: 视频通道重连失败（第 $attempt 次）- ${error.message}")
+                    try {
+                        Thread.sleep(DATA_RECONNECT_GAP_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return false
+                    }
+                }
+            }
+            return false
+        } finally {
+            reconnecting = false
         }
     }
 
@@ -234,7 +305,17 @@ class VideoSender(
     private fun passthroughKeepAliveLoop() {
         try {
             while (running.get()) {
-                val output = socket?.getOutputStream() ?: return
+                if (reconnecting) {
+                    // 重连窗口期 socket 正在被替换：让出，别抢写。
+                    Thread.sleep(100)
+                    continue
+                }
+                val output = socket?.getOutputStream()
+                if (output == null) {
+                    // 不能 `?: return`——那会让保活线程在 socket 短暂为空时永久退出。
+                    Thread.sleep(200)
+                    continue
+                }
                 maybeSendKeepAlive(output)
                 maybeResendIdleFrame(output)
                 Thread.sleep(200)
@@ -324,7 +405,9 @@ class VideoSender(
             true
         } catch (error: Exception) {
             log("VIDEO: 直通送帧失败 - ${error.message}")
-            // 同上：写失败即会话已断，复位状态让下一轮 0x4301 能重新起会话。
+            // 先试着在接收端的 8s 恢复窗口内重连视频通道；连不回来才认输复位，
+            // 让下一轮 0x4301 重新起会话。
+            if (reconnectDataPort()) return false
             stop()
             false
         }
@@ -415,8 +498,10 @@ class VideoSender(
         lastKeepAliveAt = now
         keepAliveCount++
         val frame = buildKeepAliveFrame(keepAliveWithStats, frames, bytesPerSecond, framesPerSecond)
-        output.write(frame)
-        output.flush()
+        synchronized(writeLock) {
+            output.write(frame)
+            output.flush()
+        }
         if (keepAliveCount <= 3 || keepAliveCount % 30 == 0L) {
             log(
                 "VIDEO: keepAlive #$keepAliveCount " +
@@ -502,10 +587,13 @@ class VideoSender(
         // 旧实现三项都没写——DiPlay/WinPlay 只读 body、不校验头，所以测试台一直正常，
         // 真车（Audi 4851）却黑屏（2026-10-19 用户日志）。
         val header = buildVideoConfigHeader(body.size, cfgWidth, cfgHeight)
-        output.write(header)
-        output.write(body)
-        output.flush()
-        configSent = true
+        synchronized(writeLock) {
+            // config 帧是明文，但同样不能插在别的帧中间（否则接收端按半帧解析）。
+            output.write(header)
+            output.write(body)
+            output.flush()
+            configSent = true
+        }
         log(
             "VIDEO: ✓ VideoConfig 已发送 avcC=${body.size}B（SPS ${sps.size}B/PPS ${pps.size}B，" +
                 "profile=${sps[1].toInt() and 0xFF} level=${sps[3].toInt() and 0xFF} " +
@@ -682,25 +770,28 @@ class VideoSender(
         //  - AES-128-CTR：无 tag、不改长度，密钥流跨帧连续。
         // keepAlive/config 帧在两种模式下都不加密。头只能构造一次——ChaCha 的 AAD
         // 必须是最终发出的那 128 字节（重复构造会带不同时间戳，对端解密必然失败）。
-        val header =
-            buildHeader(
-                OP_FRAME,
-                if (frameCipher is StreamFrameCipher.ChaCha) plain.size + TAG_SIZE else plain.size,
-            )
-        val sealed =
-            when (val cipher = frameCipher) {
-                is StreamFrameCipher.ChaCha ->
-                    AirPlayCrypto.chachaSeal(cipher.key, AirPlayCrypto.nonce64(frameCounter), plain, header)
-                is StreamFrameCipher.AesCtr -> {
-                    val encrypted = plain.copyOf()
-                    aesStream?.applyKeystream(encrypted)
-                    encrypted
+        // 构造头 + 加密 + 写字节 + 计数器自增必须整体串行（见 [writeLock]）。
+        synchronized(writeLock) {
+            val header =
+                buildHeader(
+                    OP_FRAME,
+                    if (frameCipher is StreamFrameCipher.ChaCha) plain.size + TAG_SIZE else plain.size,
+                )
+            val sealed =
+                when (val cipher = frameCipher) {
+                    is StreamFrameCipher.ChaCha ->
+                        AirPlayCrypto.chachaSeal(cipher.key, AirPlayCrypto.nonce64(frameCounter), plain, header)
+                    is StreamFrameCipher.AesCtr -> {
+                        val encrypted = plain.copyOf()
+                        aesStream?.applyKeystream(encrypted)
+                        encrypted
+                    }
                 }
-            }
-        frameCounter++
-        output.write(header)
-        output.write(sealed)
-        output.flush()
+            frameCounter++
+            output.write(header)
+            output.write(sealed)
+            output.flush()
+        }
         framesSent++
         framesSinceKeepAlive++
         bytesSinceKeepAlive += plain.size.toLong()
@@ -736,9 +827,11 @@ class VideoSender(
         declaredLength: Int,
         output: java.io.OutputStream,
     ) {
-        output.write(buildHeader(opcode, declaredLength))
-        output.write(body)
-        output.flush()
+        synchronized(writeLock) {
+            output.write(buildHeader(opcode, declaredLength))
+            output.write(body)
+            output.flush()
+        }
     }
 
     /** 按 00 00 00 01 / 00 00 01 起始码切分 AnnexB 码流为 NAL 列表。 */
@@ -782,6 +875,12 @@ class VideoSender(
         private const val OP_KEEP_ALIVE = 2
         private const val OP_KEEP_ALIVE_WITH_BODY = 5
         private const val TAG_SIZE = 16
+
+        /** 视频通道被重置后的重连尝试次数（接收端只等 8s，2s 超时 × 3 次刚好留余量）。 */
+        private const val DATA_RECONNECT_ATTEMPTS = 3
+
+        /** 两次重连之间的间隔。 */
+        private const val DATA_RECONNECT_GAP_MS = 500L
 
         /**
          * 头部位标志（catplay `ScreenFlag`）：写进 `small_param[1]`（头部偏移 6）。

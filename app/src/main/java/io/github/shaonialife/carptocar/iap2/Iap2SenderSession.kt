@@ -412,7 +412,9 @@ class Iap2SenderSession(
                     runCatching {
                         sendFireAndForget(
                             Iap2MessageIds.NOW_PLAYING_UPDATE,
-                            Iap2NowPlaying.encode(np),
+                            // 必须是纯参数体：sendFireAndForget 会自己补帧头，
+                            // 传 Iap2NowPlaying.encode() 会双重封包（见该函数注释）。
+                            Iap2NowPlaying.body(np),
                         )
                         log("iap2 0x5000 → 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"}）")
                     }.onFailure {
@@ -450,7 +452,8 @@ class Iap2SenderSession(
         runCatching {
             sendFireAndForget(
                 Iap2MessageIds.NOW_PLAYING_UPDATE,
-                Iap2NowPlaying.encode(np),
+                // 同上：sendFireAndForget 补帧头，这里只能给参数体。
+                Iap2NowPlaying.body(np),
             )
             log("iap2 补推 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"}）")
         }.onFailure {

@@ -38,7 +38,17 @@ object Iap2NowPlaying {
      * 构造 0x5001 NowPlayingUpdate 完整帧（带真实歌名/歌手/专辑/播放状态）。
      * 空字符串字段仍给一个空串 param，保持结构与空态常量同构。
      */
-    fun encode(np: CarPlayNowPlaying): ByteArray {
+    fun encode(np: CarPlayNowPlaying): ByteArray = Iap2Csm.encode(Iap2MessageIds.NOW_PLAYING_UPDATE, body(np))
+
+    /**
+     * 只返回**参数体**（不含 `0x4040 | len | msgId` 帧头）。
+     *
+     * 走 `send(...)/sendFireAndForget(...)` 这类「按消息 ID 发体」的链路时必须用它：
+     * 那些方法会自己补帧头，把 [encode] 的完整帧当体再封一次，对端解析出来就是
+     * `0x4040 0x5001 ...` 这种非法参数组。WinPlay 1.2.4 实测：收到双重封包的 0x5001
+     * 后其「接收进程异常」直接退出 → 蓝牙桥接被拆 → 车机不停重连（2026-10-25）。
+     */
+    fun body(np: CarPlayNowPlaying): ByteArray {
         val mediaItem =
             Iap2Csm.string(0x0001, np.title.orEmpty()) +
                 Iap2Csm.u32(0x0004, np.durationMs.toLong()) +
@@ -50,7 +60,6 @@ object Iap2NowPlaying {
                 Iap2Csm.u8(0x0005, np.shuffleMode) +
                 Iap2Csm.u8(0x0006, np.repeatMode) +
                 Iap2Csm.string(0x0007, np.appName.orEmpty())
-        val body = Iap2Csm.param(0x0000, mediaItem) + Iap2Csm.param(0x0001, playback)
-        return Iap2Csm.encode(Iap2MessageIds.NOW_PLAYING_UPDATE, body)
+        return Iap2Csm.param(0x0000, mediaItem) + Iap2Csm.param(0x0001, playback)
     }
 }
