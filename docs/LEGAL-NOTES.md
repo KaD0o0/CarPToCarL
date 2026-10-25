@@ -62,6 +62,9 @@
 
 已确认「可以开源」的几件事：
 
+- **来源清晰**：本项目由同作者的 [CarDeck](https://github.com/shaonialife/cardeck)（MIT）演化而来，
+  协议层、密码学封装、蓝牙链路与工程骨架均源自它。两个仓库同作者、同许可证，
+  互相引用不产生新的许可义务，只需保留版权声明（见 [NOTICE](../NOTICE) 第 0 节）。
 - 反编译产物、厂商 SDK、抓包原始文件全部不在版本库内
   （`.tools/`、`carlife-ref/`、`*.dex`、`*.jks` 均在 `.gitignore`）；
 - 真实热点密码只存在于运行时内存，日志里一律 `psk=***`；
@@ -93,5 +96,6 @@
 ## 7. 相关文件
 
 - [LICENSE](../LICENSE)：MIT + 授权范围说明（不授予第三方协议/专利权利）
-- [NOTICE](../NOTICE)：第三方组件、商标、构建期依赖
+- [NOTICE](../NOTICE)：参考项目（CarDeck）、第三方组件、商标、构建期依赖
 - [DISCLAIMER.md](../DISCLAIMER.md)：使用风险与驾驶安全
+- [CarDeck](https://github.com/shaonialife/cardeck)：本项目的上一代实现（同作者，MIT）

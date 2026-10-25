@@ -19,13 +19,33 @@
 
 | 项    | 值                                                                             |
 | ---- | ----------------------------------------------------------------------------- |
-| 当前版本 | `1.0.1`（正式版；修「CarPlay 不断、CarLife 重连后黑屏」；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
+| 当前版本 | `1.0.2`（正式版；说明里标注源自 CarDeck，功能同 1.0.1；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
 | 包名   | `io.github.shaonialife.carptocar`                                             |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                                     |
 | 最低系统 | Android 12（minSdk 31，targetSdk 34）                                            |
 | 适用车型 | 支持**无线 CarPlay** 的车机（真车已验证：奥迪 MIB3；测试台：DiPlay / xcertplay）                    |
 | 画面来源 | 本机 **CarLife+** 引擎（荣耀：`com.baidu.carlife.honor` 8.8.5）                        |
 | 音频   | PCM 直通（CarLife 音频通道 → AirPlay 音频通道）                                           |
+| 前身 / 参考项目 | **[CarDeck](https://github.com/shaonialife/cardeck)**（同作者的上一代项目，MIT）——本项目的协议层与工程骨架源自它 |
+
+### 与 CarDeck 的关系
+
+[CarDeck](https://github.com/shaonialife/cardeck) 是同作者的上一代项目，目标同样是「让 Android 手机
+扮演 CarPlay 发送端」。本项目在它的基础上继续演进，**复用了它的 iAP2 / AirPlay 协议实现、
+密码学封装、蓝牙链路与工程骨架**（所以日志目录仍是 `下载/CarDeck`、进程启动行仍写 `CarDeck`，
+这些是历史命名，不是依赖）。
+
+两者真正的区别在**画面来源**：
+
+| | CarDeck | CarPToCarL（本项目） |
+|---|---|---|
+| 画面来源 | 自绘隐形屏（受信虚拟屏跑手机应用）+ Shizuku 触摸注入 | **劫持本机 CarLife+ 引擎码流，不重编码** |
+| 触摸通路 | Shizuku 直注虚拟屏 | 车机 → HID → CarLife 9340 通道注入 |
+| 依赖 | 需要 Shizuku | **不依赖 Shizuku**（2026-10-24 起移除） |
+| 目标 | 隐形屏启动器 | 无线 CarPlay 投屏网关 |
+
+两个仓库都未声明或使用任何第三方的 MFi 授权，法律边界见
+[docs/LEGAL-NOTES.md](docs/LEGAL-NOTES.md)。
 
 ### 方向说明
 
@@ -674,7 +694,7 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 ## 九、签名与发布
 
 - **版本号**：`app/build.gradle.kts` 顶部 `appVersionName` 是唯一来源，`versionCode` 自动推导  
-  （`1.0.1` → `10001`，`1.0.0` → `10000`；旧实验版 `0.2.19` → `219`，升级路径连续）。
+  （`1.0.2` → `10002`，`1.0.0` → `10000`；旧实验版 `0.2.19` → `219`，升级路径连续）。
 - **签名**：release 默认退回 debug 签名；正式分发前配置真实签名：
   1. 复制 `keystore.properties.example` → `keystore.properties`（已 gitignore）
   2. `keytool -genkeypair -v -keystore carptocar-release.jks -alias carptocar -keyalg RSA -keysize 4096 -validity 10000`
@@ -688,6 +708,9 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 
 ## 十、边界、商标与合规
 
+- **前身与参考**：本项目的协议层与工程骨架源自同作者的 [CarDeck](https://github.com/shaonialife/cardeck)
+  （MIT）。两个仓库同作者、同许可证，代码可自由互相引用；CarDeck 中 `reference/` 下的
+  GPL-3.0 参考项目与本项目一样**未入库、未分发**。
 - **许可证**：源码以 [MIT](LICENSE) 发布，正文之后附了一段**授权范围说明**：MIT 只授予
   本仓库代码的著作权，**不授予** Apple / 百度的专利、协议规范、MFi 认证或任何商标权利。
 - **第三方组件**：AndroidX / Kotlin（Apache-2.0）、BouncyCastle（MIT 系）的版权声明见
@@ -710,6 +733,18 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 ---
 
 ## 十一、版本历史
+
+### 1.0.2 —— 2026-10-25（正式版 · 合规补充）
+
+**把「来自哪里」写进说明**
+
+- README 新增「与 CarDeck 的关系」：本项目是同作者上一代项目
+  [CarDeck](https://github.com/shaonialife/cardeck)（MIT）的后继，复用了它的
+  iAP2 / AirPlay 协议实现、密码学封装、蓝牙链路与工程骨架。
+- `NOTICE` 新增第 0 节 `Provenance`（随 APK 打包进 `assets/NOTICE.txt`）；
+  `docs/LEGAL-NOTES.md`、`DISCLAIMER.md` 同步标注来源。
+- 运行时仍可见的历史命名（日志目录 `下载/CarDeck`、进程启动行 `CarDeck`）注明是渊源而非依赖。
+- **功能无改动**：这一版只有文档与随包声明变化。
 
 ### 1.0.1 —— 2026-10-25（正式版 · 补丁）
 
