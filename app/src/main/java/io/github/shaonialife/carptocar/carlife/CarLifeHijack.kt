@@ -157,6 +157,22 @@ object CarLifeHijack {
     private var lastTouchAt = 0L
     private var touchCount = 0
 
+    /** 按下点（视频坐标），用于短促点击的坐标回吸。 */
+    private var downX = 0
+    private var downY = 0
+
+    /** 本次按下的起始时刻（点击判定用）。 */
+    private var tapStartedAt = 0L
+
+    /** 最近一次真正发出的坐标（补发 UP / 超时清理用）。 */
+    private var lastMoveX = 0
+    private var lastMoveY = 0
+
+    /** 被节流丢弃的最新坐标，抬起前补发以保证落点准确。 */
+    private var pendingX = 0
+    private var pendingY = 0
+    private var hasPendingMove = false
+
     /** 未开启音频通道时被丢弃的 PCM 累计字节（限频提示）。 */
     private var audioDroppedBytes = 0L
     private var lastAudioDropLog = 0L
@@ -205,8 +221,23 @@ object CarLifeHijack {
     /** 劫持是否活跃（兼容旧调用点：触摸路由据此切换目标）。 */
     val isActive: Boolean get() = running.get() && client?.isRunning == true
 
-    /** 当前 CarLife 视频分辨率（prewarm 阶段即可用于计算推流画布）。 */
+    /**
+     * 当前 CarLife **协商档位**分辨率（prewarm 阶段即可用于计算推流画布）。
+     *
+     * 这是给**视频声明**用的基准：车机按自己画布建解码器，声明必须跟车机/协商值走。
+     * 触摸映射请用 [touchVideoSize]。
+     */
     val videoSize: Pair<Int, Int>
+        get() = client?.negotiatedSize ?: (1280 to 720)
+
+    /**
+     * 触摸坐标映射基准：**码流 SPS 的真实分辨率**（拿不到时回落到协商值）。
+     *
+     * 触摸事件是回灌给手机 CarLife 引擎的，引擎按自己编码的画面坐标系解释它，
+     * 所以必须用真实码流尺寸。用协商档位（如 1280×720）去映射 1920×1080 的码流，
+     * 点击位置会整体缩到左上 2/3，右侧/底部完全点不到——这正是「触摸迟钝、点不准」的根因。
+     */
+    val touchVideoSize: Pair<Int, Int>
         get() = client?.videoSize ?: (1280 to 720)
 
     fun isEnabled(context: Context): Boolean {
@@ -399,6 +430,8 @@ object CarLifeHijack {
             )
             if (hu.start()) {
                 client = hu
+                // 会话建立前缓存过 SPS：立刻用它校准触摸基准，别等下一帧关键帧。
+                spsPps?.let { hu.seedSps(it) }
                 logSink?.invoke("CARLIFE: 劫持成功，已接管本机 CarLife 码流（等待连接车机）")
             } else {
                 logSink?.invoke("CARLIFE: 握手失败，2 秒后重试（确认 CarLife 停在「正在连接」）")
@@ -632,8 +665,13 @@ object CarLifeHijack {
     /**
      * 处理一次车机触摸报文。返回 true = 已被劫持链路消费（调用方不要再走虚拟屏注入）。
      *
-     * 坐标映射按**等比缩放 + 居中黑边（contain）**：CarLife 推的是 1280×720（16:9），
-     * 车机视图通常不是同一比例，直接线性缩放会让点击整体偏移。
+     * 坐标映射：以**码流 SPS 解析出的真实分辨率**为基准（`hu.videoSize`），
+     * 按车机端 AirPlay 播放器的实际呈现方式换算：
+     * - 车机视图与码流比例一致（差 <2%）→ 直接线性缩放，不留黑边；
+     * - 比例不一致 → 等比缩放 + 居中 letterbox（车机端播放器就是这样显示的）。
+     *
+     * 落在黑边上的点钳到画面边缘（不丢弃）：车机若有黑边，用户点它本来就是想点边缘控件，
+     * 丢弃会变成「点了没反应」。
      */
     fun handleTouch(
         slot: Int,
@@ -644,49 +682,116 @@ object CarLifeHijack {
         if (!isActive) return false
         if (slot != 0) return true // 只支持单指；多指其余槽直接吞掉，避免漏到注入路径
         val hu = client ?: return true
+        // 触摸基准必须是码流真实分辨率（SPS），不是协商档位。
         val (vw, vh) = hu.videoSize
         if (viewW <= 0 || viewH <= 0 || vw <= 0 || vh <= 0) return true
 
-        val scale = minOf(viewW.toFloat() / vw, viewH.toFloat() / vh)
+        val now = android.os.SystemClock.uptimeMillis()
+
+        // 车机端偶尔漏发 UP：手指已抬起但本地仍是按下态，下一次 DOWN 会被当成 MOVE。
+        // 超过 STALE_TOUCH_MS 没有任何事件就补一个 UP，避免「幽灵按住」。
+        if (touchPressed && now - lastTouchAt > STALE_TOUCH_MS) {
+            touchPressed = false
+            hu.touchUp(lastMoveX, lastMoveY)
+            logSink?.invoke("CARLIFE: 触摸超时，补发抬起 ($lastMoveX,$lastMoveY)")
+        }
+
+        val scale: Float
+        var offsetX = 0f
+        var offsetY = 0f
+        val viewAr = viewW.toFloat() / viewH
+        val videoAr = vw.toFloat() / vh
+        if (kotlin.math.abs(viewAr - videoAr) / videoAr <= ASPECT_TOLERANCE) {
+            scale = viewW.toFloat() / vw
+        } else {
+            scale = minOf(viewW.toFloat() / vw, viewH.toFloat() / vh)
+            offsetX = (viewW - vw * scale) / 2f
+            offsetY = (viewH - vh * scale) / 2f
+        }
         if (scale <= 0f) return true
-        val offsetX = (viewW - vw * scale) / 2f
-        val offsetY = (viewH - vh * scale) / 2f
-        val tx = ((x - offsetX) / scale).toInt().coerceIn(0, vw - 1)
-        val ty = ((y - offsetY) / scale).toInt().coerceIn(0, vh - 1)
+
+        val mappedX = (x - offsetX) / scale
+        val mappedY = (y - offsetY) / scale
+        val outside = mappedX < 0f || mappedY < 0f || mappedX > vw - 1f || mappedY > vh - 1f
+        val tx = mappedX.toInt().coerceIn(0, vw - 1)
+        val ty = mappedY.toInt().coerceIn(0, vh - 1)
 
         when {
             down && !touchPressed -> {
                 touchPressed = true
+                downX = tx
+                downY = ty
+                tapStartedAt = now
+                lastMoveX = tx
+                lastMoveY = ty
+                lastTouchAt = now
+                hasPendingMove = false
                 hu.touchDown(tx, ty)
             }
 
             down -> {
-                // MOVE 节流：过密只会把事件堆在手机侧（与 TouchRouter 同一策略）
-                val now = android.os.SystemClock.uptimeMillis()
-                if (now - lastTouchAt < MOVE_THROTTLE_MS) return true
+                if (now - lastTouchAt < MOVE_THROTTLE_MS) {
+                    // 节流期内只记下最新坐标，抬起前若有落差会补发一帧，
+                    // 保证「快速拖动后松手」落在用户手指真实位置。
+                    pendingX = tx
+                    pendingY = ty
+                    hasPendingMove = true
+                    return true
+                }
                 lastTouchAt = now
+                lastMoveX = tx
+                lastMoveY = ty
+                hasPendingMove = false
                 hu.touchMove(tx, ty)
             }
 
             !down && touchPressed -> {
                 touchPressed = false
-                hu.touchUp(tx, ty)
+                lastTouchAt = now
+                // 短促且几乎没有位移 = 点击：用按下点收尾，避免车机端把轻微抖动当拖动、
+                // 或把抬起坐标算到相邻控件上（触摸不准的一半原因就出在这里）。
+                val isTap = now - tapStartedAt <= TAP_MAX_MS &&
+                    kotlin.math.abs(tx - downX) <= TAP_MAX_DRIFT_PX &&
+                    kotlin.math.abs(ty - downY) <= TAP_MAX_DRIFT_PX
+                val ux = if (isTap) downX else tx
+                val uy = if (isTap) downY else ty
+                if (!isTap && hasPendingMove && (pendingX != lastMoveX || pendingY != lastMoveY)) {
+                    hu.touchMove(pendingX, pendingY)
+                }
+                hasPendingMove = false
+                lastMoveX = ux
+                lastMoveY = uy
+                hu.touchUp(ux, uy)
             }
 
             else -> return true
         }
         touchCount++
         if (touchCount <= 6 || touchCount % 100 == 0) {
+            val basis = if (hu.videoSizeConfirmed) "SPS" else "协商"
             logSink?.invoke(
                 "CARLIFE: 触控 ($x,$y) → ($tx,$ty) " +
-                    "${if (down) "按下/移动" else "抬起"}（视图 ${viewW}x$viewH → 视频 ${vw}x$vh）",
+                    "${if (down) "按下/移动" else "抬起"}（视图 ${viewW}x$viewH → " +
+                    "视频 ${vw}x$vh[$basis]${if (outside) " 黑边" else ""}）",
             )
         }
         return true
     }
 
-    /** MOVE 注入节流（毫秒），与 TouchRouter 默认值一致。 */
-    private const val MOVE_THROTTLE_MS = 24L
+    /** MOVE 注入节流（毫秒）。队列侧还会合并重复 MOVE，这里只防抖。 */
+    private const val MOVE_THROTTLE_MS = 16L
+
+    /** 视图与码流比例差在此范围内视为一致（避免浮点误差带来 1~2px 黑边）。 */
+    private const val ASPECT_TOLERANCE = 0.02f
+
+    /** 点击判定：按住时长上限（毫秒）。 */
+    private const val TAP_MAX_MS = 350L
+
+    /** 点击判定：允许的手指抖动（视频像素）。 */
+    private const val TAP_MAX_DRIFT_PX = 8
+
+    /** 按下后多久没有任何事件就认定 UP 丢失（毫秒）。 */
+    private const val STALE_TOUCH_MS = 3_000L
 
     /** 「音频被丢弃」提示的限频（毫秒）。 */
     private const val AUDIO_DROP_LOG_MS = 10_000L
