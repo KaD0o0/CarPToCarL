@@ -95,14 +95,26 @@ internal object CarLifeProtocol {
 
     // ---- 触控（9340 / Touch 通道，**控制帧格式** 8B 头）----
     //
-    // 反编译 MD 端 CarlifeTouchManager.dispatchTouchEvent 实证：它是
-    // `packed-switch` 到 0x68001 起的连续 ID，**动作由消息 ID 决定**，
-    // 负载是 CarlifeTouchSinglePoint{x, y, pointerx, pointery}（没有 action 字段）。
-    // 0x68004 才是硬按键（负载 CarlifeCarHardKeyCode），0x6800D 是复合动作
-    // （CarlifeTouchAction{action,x,y,pointerx,pointery}）。
-    const val TOUCH_DOWN = 425985 // 0x68001
-    const val TOUCH_MOVE = 425986 // 0x68002
+    // 消息 ID 以 **HU 端官方 SDK** 为准（.tools/carlife-ref 的
+    // CarLife-Android-Vehicle/src/com/baidu/carlifevehicle/CommonParams.java）：
+    //
+    //   0x68001 MSG_TOUCH_ACTION        复合动作（CarlifeTouchAction{action,x,y,…}）
+    //   0x68002 MSG_TOUCH_ACTION_DOWN   单点（CarlifeTouchSinglePoint{x,y}）
+    //   0x68003 MSG_TOUCH_ACTION_UP     单点
+    //   0x68004 MSG_TOUCH_ACTION_MOVE   单点
+    //   0x68005 SINGLE_CLICK · 0x68006 DOUBLE_CLICK · 0x68007 LONG_PRESS
+    //   0x68008 CAR_HARD_KEY_CODE · 0x6800A ACTION_BEGIN · 0x6800D 复合（MD 端）
+    //
+    // **踩过的坑（2026-10-25）**：这里曾按「0x68001 DOWN / 0x68002 MOVE / 0x68003 UP」
+    // 连号推断，结果整条手势全错位——`0x68002` 其实是 UP、`0x68003` 才是 UP 的邻居
+    // 0x68003 同样是 UP（MOVE 在 0x68004）。于是车机端每次拖动变成：
+    //   0x68001（复合动作，action 缺省=按下）→ 0x68002（=抬起！）→ …
+    // 手指刚动第一下引擎就收到「抬起」，手势立刻结束，只剩原地一次点击。
+    // 表现正是「能点、点得准，但拖不动、列表不跟手」。坐标映射一直是对的，别再去调缩放。
+    const val TOUCH_ACTION = 425985 // 0x68001 复合动作（保留，未使用）
+    const val TOUCH_DOWN = 425986 // 0x68002
     const val TOUCH_UP = 425987 // 0x68003
+    const val TOUCH_MOVE = 425988 // 0x68004
 
     const val HEARTBEAT = 131074
 

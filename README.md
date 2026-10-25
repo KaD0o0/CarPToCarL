@@ -227,7 +227,22 @@ CarLife+，那就把它的视频/音频流**截下来直通**给车机。两边�
 
 ### 触摸迟钝 / 拖不动 / 点不准
 
-按 2026-10-25 实测日志 + 引擎字节码定位到 5 个原因，均已修：
+按 2026-10-25 实测日志 + 引擎字节码定位到 6 个原因，均已修：
+
+0. **触摸命令 ID 全错位（v0.2.19 修正，这才是「能点但拖不动」的真因）**。
+   HU 端官方 SDK（`.tools/carlife-ref` 的 `CarLife-Android-Vehicle`）定义：
+   ```
+   0x68001 MSG_TOUCH_ACTION        复合动作（CarlifeTouchAction）
+   0x68002 MSG_TOUCH_ACTION_DOWN   单点
+   0x68003 MSG_TOUCH_ACTION_UP     单点
+   0x68004 MSG_TOUCH_ACTION_MOVE   单点
+   0x68005 SINGLE_CLICK · 0x68006 DOUBLE_CLICK · 0x68007 LONG_PRESS · 0x68008 硬按键
+   ```
+   旧代码按「0x68001 DOWN / 0x68002 MOVE / 0x68003 UP」连号推断，全错了一格：
+   实际发出的序列是 `0x68001(复合动作，按下) → 0x68002(=抬起！) → …`。
+   手指刚动第一下，引擎就收到「抬起」，手势立刻结束 —— 表现正是
+   **点得准、能点开应用，但拖拽完全不动、列表不跟手**。
+   坐标映射一直是对的，别再动缩放。
 
 1. **坐标被缩放了两次（v0.2.17 修正）**。引擎 `CarlifeTouchManager.dispatchTouchEvent`
    拿到 x/y 后会自己乘 `getTouchXOffset()`：mix 连接下是 `CastConfig.width / mContainerWidth`，
@@ -323,9 +338,20 @@ v0.2.16 起直通模式在**空闲 1.5 秒**后每 2 秒重发**最后一个 IDR
 
 ### 车机上没有歌名歌词
 
-- 检查通知使用权是否授予（读不到媒体会话就没有歌名）。
-- 检查日志里 98386 是否包含 `MEDIA_LYRIC_SUPPORT=1`。
-- 确认音乐 App 正在播放且媒体会话可见。
+按这三条依次查（2026-10-25 全部实测踩过）：
+
+1. **`dumpsys notification` 的 `Live notification listeners` 里有没有本应用**。
+   重装 APK 后常见：授权还在 `enabled_notification_listeners` 里，但系统没把监听器
+   绑上 → `MediaSession.metadata` 恒为 null → 车机整程空白。
+   v0.2.19 起应用自己会 `requestRebind` 试着恢复；**荣耀 MagicOS 上该 API 不生效**，
+   日志会打出提示，此时到「设置 → 通知使用权」把本应用**关掉再打开**一次即可。
+   （开发机上等价操作：`adb shell cmd notification disallow_listener <包>/<服务>`
+   然后 `allow_listener` 同一个组件。）
+2. **看日志有没有 `iap2 0x5000（订阅）暂无媒体信息——1500ms 后重试`**。
+   接收端只在 bring-up 后订阅一次 0x5000，而媒体信息（尤其冷启动/重装后）要几秒才就绪。
+   v0.2.19 起按 1.5s/4s/8s/15s/25s 退避重试，拿到信息就发 0x5001；
+   旧版 provider 返回 null 时直接静默放弃，一条都不发。
+3. 检查 98386 是否包含 `MEDIA_LYRIC_SUPPORT=1`，并确认音乐 App 正在播放且媒体会话可见。
 
 ### App 显示「直通中」但车机没画面
 

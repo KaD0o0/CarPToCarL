@@ -26,6 +26,7 @@ import io.github.shaonialife.carptocar.input.TouchRouter
 import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.media.MediaSessionsState
+import io.github.shaonialife.carptocar.media.NotificationAccess
 import io.github.shaonialife.carptocar.net.AirPlayFeatures
 import io.github.shaonialife.carptocar.net.CarPlayCtrlAdvertiser
 import io.github.shaonialife.carptocar.net.CarPlayServiceBrowser
@@ -133,6 +134,55 @@ object SessionController {
         // 主线程调用 shell 的告警（历史上两次真机 ANR 都源于此；HKS 下 logcat 不可读）
         SysShell.violationSink = ::appendLog
         installNowPlayingBridge()
+        startMediaWatchdog()
+    }
+
+    /** 媒体看门狗是否已启动（幂等）。 */
+    private var mediaWatchdogStarted = false
+
+    /**
+     * 媒体信息看门狗：**通知监听器没被系统绑上时，定时用系统 API 请求重绑**。
+     *
+     * 为什么需要：重装 APK 后授权还在（`enabled_notification_listeners` 里有本组件），
+     * 但系统的「Live notification listeners」里已经没有它——`onListenerConnected`
+     * 不来，`MediaSession.metadata` 就恒为 null，车机端歌名整程空白
+     * （2026-10-25 实测：`dumpsys notification` Live 段无本组件 → 0x5000 到达时
+     * provider 返回 null → 一条 0x5001 都发不出去）。
+     *
+     * 旧的自动恢复走 `cmd notification disallow/allow`，需要 shell/Shizuku；用户移除
+     * Shizuku 后就永久坏掉。这里改用系统公开 API `requestRebind()`，无需任何权限。
+     * 连上后拉长到 60s 只看不动，避免无意义调用。
+     */
+    private fun startMediaWatchdog() {
+        if (mediaWatchdogStarted) return
+        mediaWatchdogStarted = true
+        Thread({
+            var attempts = 0
+            var hinted = false
+            while (true) {
+                val connected = NotificationAccess.isConnected
+                try {
+                    Thread.sleep(if (connected) 60_000L else 8_000L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (NotificationAccess.isConnected) continue
+                val context = appContext ?: continue
+                attempts++
+                NotificationAccess.requestSystemRebind(context, ::appendLog)
+                // requestRebind 在部分 ROM（荣耀 MagicOS 实测）不生效：系统只认
+                // 「通知使用权」设置页里的手动关→开。3 次（≈24s）仍没绑上就明说，
+                // 免得用户对着没有歌名的车机猜。
+                if (!hinted && attempts >= 3) {
+                    hinted = true
+                    appendLog(
+                        "MEDIA: ⚠ 通知使用权已授权但系统始终没绑定监听器——" +
+                            "请到「设置 → 通知使用权」把本应用关掉再打开一次（车机歌名依赖它）",
+                    )
+                    uiHintSink?.invoke("车机歌名不显示：请到「设置 → 通知使用权」把本应用关掉再打开")
+                }
+            }
+        }, "media-watchdog").apply { isDaemon = true }.start()
     }
 
     /** 注册 CarLife 媒体信息 → iAP2 0x5001 的桥接（幂等，见 [ensure]）。 */
@@ -178,6 +228,18 @@ object SessionController {
 
     /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null
+
+    /**
+     * 新一轮连接开始：清掉 0x5001 去重键。
+     *
+     * 去重键是「上次推过什么」，跨会话保留就是 bug：同一首歌在重连后需要重推一次
+     * （接收端重连后是全新会话，之前收到的歌名不算数）。旧实现里 18:26 推过
+     * 「真爱假说」后，18:35 重连的整轮会话即使媒体事件触发也会被这行去重静默吞掉
+     * ——车机端持续空白，日志里连一行「补推」都没有（2026-10-25 实测）。
+     */
+    fun resetNowPlayingDedupe() {
+        lastPushedNowPlayingKey = null
+    }
 
     /**
      * 合并两个歌名数据源，构造 iAP2 0x5001 载荷。
@@ -511,6 +573,8 @@ object SessionController {
     fun startConnection(context: Context) {
         connectCancelled = false
         phaseHint = "蓝牙就绪，等待车机回连…"
+        // 新会话 = 新的 NowPlaying 上下文：清去重键，否则同一首歌重连后不会被重推
+        resetNowPlayingDedupe()
         CarPlayService
             .start(context)
         // 能力发布先于连接（catplay 的做法：CarPlayCtrlServer 在会话一开始就常驻广播

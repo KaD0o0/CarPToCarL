@@ -407,20 +407,7 @@ class Iap2SenderSession(
             // 真车（MIB3）的 NowPlaying 订阅走 WiFi 隧道（VirtualIap2Link），此处
             // provider 为 null 时静默忽略，不影响链路。
             if (frame.messageId == Iap2MessageIds.START_NOW_PLAYING_UPDATES) {
-                val np = nowPlayingProvider?.invoke()
-                if (np != null) {
-                    runCatching {
-                        sendFireAndForget(
-                            Iap2MessageIds.NOW_PLAYING_UPDATE,
-                            // 必须是纯参数体：sendFireAndForget 会自己补帧头，
-                            // 传 Iap2NowPlaying.encode() 会双重封包（见该函数注释）。
-                            Iap2NowPlaying.body(np),
-                        )
-                        log("iap2 0x5000 → 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"}）")
-                    }.onFailure {
-                        log("iap2 0x5001 发送失败 - ${it.message}")
-                    }
-                }
+                answerNowPlaying("订阅", retriesLeft = nowPlayingRetryDelaysMs.size)
             }
             if (frame.messageId == lastLoggedId) {
                 repeatCount++
@@ -449,17 +436,83 @@ class Iap2SenderSession(
      */
     fun pushNowPlaying() {
         val np = nowPlayingProvider?.invoke() ?: return
+        sendNowPlaying(np, "补推")
+    }
+
+    /**
+     * 应答 0x5000 订阅（含重试）。
+     *
+     * **为什么必须重试**：接收端（WinPlay/DiPlay 测试台）只在 bring-up 后订阅一次
+     * 0x5000，之后切歌不会再订阅；而手机侧媒体信息总有空窗——重装 APK/冷启动后
+     * 通知监听器要先被系统重新绑定、MediaSession 先报播放状态再补 metadata，
+     * 这一小段里 [nowPlayingProvider] 返回 null。旧实现 null 就静默放弃，于是整程
+     * 没有歌名（2026-10-25 实测：18:35 那轮 0x5000 到达 2 次，0x5001 一条都没发，
+     * 日志里连失败行都没有——因为压根没进发送分支）。
+     *
+     * 现在按 [nowPlayingRetryDelaysMs] 退避重试；新订阅会作废上一轮的待重试任务
+     * （[npGeneration]），避免多条线程同时推送。
+     */
+    private fun answerNowPlaying(
+        tag: String,
+        retriesLeft: Int,
+    ) {
+        val provider = nowPlayingProvider ?: return
+        val generation = npGeneration.incrementAndGet()
+        nowPlayingRetry.execute {
+            var remaining = retriesLeft
+            while (remaining >= 0) {
+                if (!channel.isAlive || npGeneration.get() != generation) return@execute
+                val np = provider()
+                if (np != null) {
+                    sendNowPlaying(np, tag)
+                    return@execute
+                }
+                if (remaining == 0) {
+                    log("iap2 0x5000（$tag）重试用尽仍读不到媒体信息——本轮放弃（切歌时会再补推）")
+                    return@execute
+                }
+                val index = nowPlayingRetryDelaysMs.size - remaining
+                val delay = nowPlayingRetryDelaysMs[index.coerceIn(0, nowPlayingRetryDelaysMs.size - 1)]
+                log("iap2 0x5000（$tag）暂无媒体信息——${delay}ms 后重试（剩 $remaining 次）")
+                try {
+                    Thread.sleep(delay)
+                } catch (_: InterruptedException) {
+                    return@execute
+                }
+                remaining--
+            }
+        }
+    }
+
+    /** 真正下发一条 0x5001（参数体，帧头由 [sendFireAndForget] 补）。 */
+    private fun sendNowPlaying(
+        np: CarPlayNowPlaying,
+        tag: String,
+    ) {
         runCatching {
             sendFireAndForget(
                 Iap2MessageIds.NOW_PLAYING_UPDATE,
-                // 同上：sendFireAndForget 补帧头，这里只能给参数体。
+                // 必须是纯参数体：sendFireAndForget 会自己补帧头，
+                // 传 Iap2NowPlaying.encode() 会双重封包（见该函数注释）。
                 Iap2NowPlaying.body(np),
             )
-            log("iap2 补推 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"}）")
+            log("iap2 $tag 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"}）")
         }.onFailure {
-            log("iap2 0x5001 补推失败 - ${it.message}")
+            log("iap2 0x5001 发送失败（$tag）- ${it.message}")
         }
     }
+
+    /** 0x5000 应答重试退避（毫秒）：覆盖「通知监听器重绑 + metadata 补齐」的常见空窗。 */
+    private val nowPlayingRetryDelaysMs = longArrayOf(1_500, 4_000, 8_000, 15_000, 25_000)
+
+    /** 单调递增的订阅代次：新订阅作废旧的重试任务。 */
+    private val npGeneration = java.util.concurrent.atomic.AtomicInteger()
+
+    /** 0x5001 重试专用单线程（daemon）：不占用 iAP2 收包线程，会话结束自动退出进程。 */
+    private val nowPlayingRetry =
+        java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "iap2-nowplaying").apply { isDaemon = true }
+        }
 
     /**
      * 保活期间收到 0x4301：解析成端点交给主控（配对窗口内热更新，或上一轮失败后重走）。

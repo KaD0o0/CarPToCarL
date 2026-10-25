@@ -163,6 +163,9 @@ object NotificationAccess {
     @Volatile
     private var serviceConnected: Boolean = false
 
+    /** 监听器是否真的被系统绑上（决定能否读到 metadata）。 */
+    val isConnected: Boolean get() = serviceConnected
+
     internal fun markConnected() {
         serviceConnected = true
     }
@@ -170,6 +173,46 @@ object NotificationAccess {
     internal fun markDisconnected() {
         serviceConnected = false
     }
+
+    /**
+     * **不需要 shell 的重绑**：`NotificationListenerService.requestRebind()`。
+     *
+     * 场景：重装 APK 后本组件仍在 `enabled_notification_listeners` 里（授权没丢），
+     * 但系统的「Live notification listeners」里已经没有它 → [MediaListenerService]
+     * 的 `onListenerConnected` 不会被调用 → `metadata` 恒为 null → 车机端歌名空白。
+     * 旧实现只靠 [rebindIfNotConnected]（`cmd notification disallow/allow`，要 shell/Shizuku），
+     * 用户把 Shizuku 移除后就再也恢复不了（2026-10-25 实测：授权在列表里、Live 段没有本组件，
+     * 车机整程无歌名）。
+     *
+     * requestRebind 是系统公开 API（24+），已授权时调用即可触发重绑，**无需任何权限**。
+     * 调用方应做限频（见 [REBIND_MIN_INTERVAL_MS]）。
+     *
+     * @return true = 已发起重绑请求
+     */
+    fun requestSystemRebind(
+        context: Context,
+        log: (String) -> Unit,
+    ): Boolean {
+        if (serviceConnected) return false
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastRebindRequestAt < REBIND_MIN_INTERVAL_MS) return false
+        lastRebindRequestAt = now
+        return runCatching {
+            android.service.notification.NotificationListenerService.requestRebind(
+                MediaListenerService.componentName(context),
+            )
+            log("MEDIA: 通知监听器未被系统绑定——已请求重绑（系统 API，无需 shell）")
+            true
+        }.getOrElse {
+            log("MEDIA: 请求重绑失败 - ${it.message}")
+            false
+        }
+    }
+
+    private var lastRebindRequestAt = 0L
+
+    /** 重绑限频：系统绑定是异步的，短时间连点没有意义。 */
+    private const val REBIND_MIN_INTERVAL_MS = 10_000L
 
     private val rebinding = AtomicBoolean(false)
 }
