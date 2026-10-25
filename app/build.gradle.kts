@@ -10,9 +10,10 @@ plugins {
  *
  * `versionCode` 由 `versionName` **推导**而不是手填两处——两者不同步是更新失效的
  * 经典原因（系统只看 versionCode，填小了用户装不上新包，且不会有任何提示）。
- * 0.x 表示实验性阶段；发布前只需改这一行。
+ * 0.x 为实验阶段；**1.0.0 起为正式版**（1.0.0 → versionCode 10000，仍大于 0.2.19 的 219）。
+ * 发布前只需改这一行。
  */
-val appVersionName = "0.2.19"
+val appVersionName = "1.0.0"
 val appVersionCode =
     appVersionName
         .split(".")

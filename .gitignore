@@ -23,3 +23,6 @@ keystore.properties
 
 # 车型重放 fixtures（含真实地址/热点名，逐条评审后才入册）
 app/src/test/resources/carplay/fixtures/*.jsonl
+
+# 本地发布产物（APK 不入库）
+dist/

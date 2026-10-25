@@ -19,7 +19,7 @@
 
 | 项    | 值                                                                  |
 | ---- | ------------------------------------------------------------------ |
-| 当前版本 | `0.2.14`（实验阶段；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
+| 当前版本 | `1.0.0`（首个正式版，2026-10-25；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
 | 包名   | `io.github.shaonialife.carptocar`                                  |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                          |
 | 最低系统 | Android 12（minSdk 31，targetSdk 34）                                 |
@@ -473,7 +473,7 @@ adb shell "run-as io.github.shaonialife.carptocar cat files/main_debug.log"
 其它命令：
 
 ```bash
-./gradlew :app:assembleRelease      # 发布包
+./gradlew :app:assembleRelease      # 发布包（1.0.0 起为正式版；需联网下载 lint-gradle，曾缺失时用 --offline 会失败）
 ./gradlew testDebugUnitTest         # 单元测试（33 个测试文件）
 ./gradlew :app:lintDebug            # lint 检查
 ```
@@ -481,7 +481,8 @@ adb shell "run-as io.github.shaonialife.carptocar cat files/main_debug.log"
 - `.tools/` 是工具链 junction（JDK 17 + Android SDK 34 + Gradle 8.10.2），  
   指向 `../cardeck/.tools`（Windows 目录 junction，共享工具链，省 ~870MB）。
 - `init-mirror.gradle` 把依赖源指向腾讯云镜像（`google()` / `mavenCentral()` 本机易超时）。
-- 产物：`app/build/outputs/apk/debug/app-debug.apk`
+- 产物：debug → `app/build/outputs/apk/debug/app-debug.apk`；  
+  release → `app/build/outputs/apk/release/app-release.apk`。
 
 ### 安装与调试
 
@@ -551,9 +552,6 @@ CarPToCarL/
 └── util/          (5)            # 后台任务池、日志导出、设备标识
 ```
 
-
-```
-
 ### 各包职责速查
 
 | 包 | 定位 | 关键内容 |
@@ -610,7 +608,7 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 ## 九、签名与发布
 
 - **版本号**：`app/build.gradle.kts` 顶部 `appVersionName` 是唯一来源，`versionCode` 自动推导
-  （目前 `0.2.14` → `214`）。
+  （`1.0.0` → `10000`；旧实验版 `0.2.19` → `219`，升级路径连续）。
 - **签名**：release 默认退回 debug 签名；正式分发前配置真实签名：
   1. 复制 `keystore.properties.example` → `keystore.properties`（已 gitignore）
   2. `keytool -genkeypair -v -keystore carptocar-release.jks -alias carptocar -keyalg RSA -keysize 4096 -validity 10000`
@@ -628,4 +626,48 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 - 「CarPlay」「AirPlay」「CarLife」均为其权利人的商标，文中出现仅作**描述性引用**。
 - 本项目**不使用** Apple、百度或任何车厂的图形标识与认证标（含 MFi）。
 - 真车验证前，建议先用可借到的 iPhone 与车机做一次正常无线配对，留作对照基线。
-```
+
+---
+
+## 十一、版本历史
+
+### 1.0.0 —— 2026-10-25（首个正式版）
+
+从 0.1 的实验性劫持走到「装完能日常用」，这一版把前面踩过的坑都收敛成了规则：
+
+**连接与稳定性**
+
+- 无线 iAP2 + AirPlay 全流程：0x4301 拿热点凭据 → PairVerify → H.264 推流 → HID 触摸回传
+- 修 0x5001 **双重封包**：蓝牙链路多出 136B 净荷，对端接收进程当场崩（模拟器「接收进程异常」）
+- 视频 socket 加**写锁**（nonce 依赖到达顺序，只锁写字节不够）+ 断链重连窗口（3×2s），
+  重连后重置帧计数 / IDR 缓存 / `configSent`
+- 空闲 1.5s 起每 2s 重发**最后一个 IDR**（绝不重发 P 帧，重复 P 帧会花屏）
+- 连接目标回退：目标设备连续 2 轮失败即放开全部已配对设备，不再死等 44s
+
+**画面**
+
+- CarLife 码流**直通**（不重编码），`VideoConfig` 声明跟车机画布
+- SPS 解析修正（constraint flags 只读 8 位，多读 8 位会导致整段错位 → 一直解析失败）
+- 帧率：车联「投屏显示设置 → 帧率 = 60」+ `98316` 申请 60，实测 ~60fps（默认档只有 20）
+- 分辨率：车联保持「默认」，与车机实际分辨率对齐（`needAdapterScreen=true`，宁可黑边不拉伸）
+
+**触摸**
+
+- **命令 ID 纠正**：`DOWN=0x68002 / UP=0x68003 / MOVE=0x68004`（旧版全错一格，
+  手指一动就抬笔 → 「能点、点得准，但拖不动」）
+- **坐标原样透传**：引擎自己按容器尺寸换算，App 再缩放一次就是「点偏」
+- 异步队列：DOWN/UP 保序、MOVE 队尾合并、上限 8，连续滑动不积压
+- 缺 UP 自愈：220ms 新手势判定补发 UP + 3s 超时兜底，躲开引擎 `eventIng` 死锁
+
+**音频与媒体**
+
+- PCM 直通，播放 / 暂停联动
+- 歌名 / 歌手 / 歌词：98386 `MEDIA_LYRIC_SUPPORT=1` + iAP2 0x5001
+  （订阅按 1.5s/4s/8s/15s/25s 退避重试，不再「订阅那一刻没读到就整程空白」）
+- 通知监听器自愈：`requestRebind` + watchdog；MagicOS 上该 API 不生效，需去设置页关开一次
+
+**工程**
+
+- 版本号单一来源：`appVersionName` 推导 `versionCode`（1.0.0 → 10000）
+- lint 基线 + 提交前钩子；release 走 `lintVitalRelease`，构建不过直接失败
+
