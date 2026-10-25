@@ -1962,7 +1962,12 @@ object SessionController {
                                             // 静默计数，避免释放事件刷屏
                                             consumerReleaseCount++
                                         } else if (contacts != null) {
-                                            if (touchLogCount <= 30 || touchLogCount % 50 == 0) {
+                                            // 限频只压 MOVE（拖拽时每秒上百条）；
+                                            // **抬起永远记录**——排查手势卡死时最需要看的就是
+                                            // 「UP 到底有没有从车机发过来」。
+                                            // 只看 slot 0：多槽格式里 slot 1 常驻 (0,0)↑ 占位。
+                                            val hasRelease = contacts.any { it.slot == 0 && !it.down }
+                                            if (hasRelease || touchLogCount <= 30 || touchLogCount % 50 == 0) {
                                                 appendLog(
                                                     "EVENT: 触摸 " +
                                                         contacts.joinToString {

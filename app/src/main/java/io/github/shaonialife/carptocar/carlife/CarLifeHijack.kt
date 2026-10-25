@@ -174,6 +174,16 @@ object CarLifeHijack {
     private var lastMoveX = 0
     private var lastMoveY = 0
 
+    /** 本次手势内已发送的 MOVE 条数（手势日志用）。 */
+    private var gestureMoves = 0
+
+    /** 本次手势起始时刻（手势日志用）。 */
+    private var gestureStartAt = 0L
+
+    /** 观测到的上报坐标最大值，用于发现「上报域 ≠ 视图域」。 */
+    private var observedMaxX = 0
+    private var observedMaxY = 0
+
     /** 未开启音频通道时被丢弃的 PCM 累计字节（限频提示）。 */
     private var audioDroppedBytes = 0L
     private var lastAudioDropLog = 0L
@@ -232,11 +242,10 @@ object CarLifeHijack {
         get() = client?.negotiatedSize ?: (1280 to 720)
 
     /**
-     * 触摸坐标映射基准：**码流 SPS 的真实分辨率**（拿不到时回落到协商值）。
+     * 码流真实分辨率（SPS），**仅用于诊断与画面比例判断，不参与触摸映射**。
      *
-     * 触摸事件是回灌给手机 CarLife 引擎的，引擎按自己编码的画面坐标系解释它，
-     * 所以必须用真实码流尺寸。用协商档位（如 1280×720）去映射 1920×1080 的码流，
-     * 点击位置会整体缩到左上 2/3，右侧/底部完全点不到——这正是「触摸迟钝、点不准」的根因。
+     * v0.2.15 曾用它当触摸基准，是错的：引擎 `getTouchXOffset()` 的输入域是车机容器坐标，
+     * 换算在引擎侧完成，我们再按码流缩一次就是二次缩放。v0.2.17 起触摸坐标原样透传。
      */
     val touchVideoSize: Pair<Int, Int>
         get() = client?.videoSize ?: (1280 to 720)
@@ -275,6 +284,9 @@ object CarLifeHijack {
         logSink = log
         touchPressed = false
         touchCount = 0
+        gestureMoves = 0
+        observedMaxX = 0
+        observedMaxY = 0
         hasVideo = false
         requestedFps = context
             .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -371,6 +383,7 @@ object CarLifeHijack {
         audioSink?.stop()
         audioSink = null
         touchPressed = false
+        gestureMoves = 0
         worker?.interrupt()
         worker = null
         logSink = null
@@ -666,8 +679,14 @@ object CarLifeHijack {
     /**
      * 处理一次车机触摸报文。返回 true = 已被劫持链路消费（调用方不要再走虚拟屏注入）。
      *
-     * 坐标映射以**码流 SPS 解析出的真实分辨率**为基准（`hu.videoSize`），
-     * 按车机端「把码流铺满 display」的实际呈现方式做纯线性缩放。
+     * **坐标一律原样透传**（车机 display 坐标，即 viewW×viewH 域）。
+     *
+     * 引擎侧 `CarlifeTouchManager.dispatchTouchEvent` 拿到的 x/y 会自己乘
+     * `getTouchXOffset()`：mix 连接下是 `CastConfig.width / mContainerWidth`，
+     * 普通投屏下是 `手机屏宽 / mContainerWidth`——也就是说**引擎的输入域就是车机容器坐标，
+     * 换算由它完成**。我们若先按码流 SPS 分辨率再缩一次，等于二次缩放：
+     * 码流 1280×720、车机画布 1412×654 时横竖向各缩 10%，拖拽位移同比变小、
+     * 松手落点偏移（v0.2.15 引入的问题，v0.2.17 撤销）。
      */
     fun handleTouch(
         slot: Int,
@@ -678,82 +697,119 @@ object CarLifeHijack {
         if (!isActive) return false
         if (slot != 0) return true // 只支持单指；多指其余槽直接吞掉，避免漏到注入路径
         val hu = client ?: return true
-        // 触摸基准必须是码流真实分辨率（SPS），不是协商档位。
-        val (vw, vh) = hu.videoSize
-        if (viewW <= 0 || viewH <= 0 || vw <= 0 || vh <= 0) return true
+        if (viewW <= 0 || viewH <= 0) return true
 
         val now = android.os.SystemClock.uptimeMillis()
+        val tx = x.coerceIn(0, viewW - 1)
+        val ty = y.coerceIn(0, viewH - 1)
+        if (x > observedMaxX) observedMaxX = x
+        if (y > observedMaxY) observedMaxY = y
 
-        // 车机端偶尔漏发 UP：手指已抬起但本地仍是按下态，下一次 DOWN 会被当成 MOVE。
-        // 超过 STALE_TOUCH_MS 没有任何事件就补一个 UP，避免「幽灵按住」。
-        if (touchPressed && now - lastTouchAt > STALE_TOUCH_MS) {
-            touchPressed = false
-            hu.touchUp(lastMoveX, lastMoveY)
-            logSink?.invoke("CARLIFE: 触摸超时，补发抬起 ($lastMoveX,$lastMoveY)")
+        // ---- 手势收尾：车机漏发 UP 会让引擎永久卡在「按住」状态 ----
+        //
+        // 引擎 onActionDownEvent 里有这段（已反汇编确认）：
+        //   if (isErrorTouchModel()) { if (eventIng) { 记录 errorDown; return } }  // DOWN 被丢弃
+        //   eventIng = true
+        // 一旦某一笔的 UP 没送到，eventIng 永远是 true → 之后每一次 DOWN 都被丢弃，
+        // 只剩 MOVE，而 MOVE 又被 isErrorEvent 判成「更靠近上次的错误按下点」而 return。
+        // 表现就是：点一下（或拖一下）之后，整块屏幕再也点不动、拖不动。
+        //
+        // 所以不能等 3 秒兜底：只要与上一笔间隔超过 NEW_GESTURE_GAP_MS 又收到按下，
+        // 就认定上一笔缺抬起，先补一个 UP 再开新笔。
+        if (touchPressed) {
+            val gap = now - lastTouchAt
+            if (gap > NEW_GESTURE_GAP_MS && down) {
+                finishGesture(hu, lastMoveX, lastMoveY, now, gap, "上一笔缺抬起 ${gap}ms")
+            } else if (gap > STALE_TOUCH_MS) {
+                finishGesture(hu, lastMoveX, lastMoveY, now, gap, "触摸超时 ${gap}ms")
+            }
         }
-
-        // 坐标映射：**纯线性缩放**。
-        //
-        // 直通模式下我们把 CarLife 的 H.264 原样交给车机，车机侧 AirPlay 播放器
-        // 会把码流铺满整个 display（不做 letterbox）。所以反向换算就是
-        // x * vw / viewW、y * vh / viewH。
-        //
-        // 旧实现按「等比缩放 + 居中黑边」算：16:9 码流配 21:9 车机时左侧黑边 125px、
-        // 缩放系数 0.908，整屏点击横向偏移最多约 9% 宽，拖拽时位移还被系数缩小，
-        // 手指划 100px 画面只动 91px —— 拖拽发涩、松手位置错，根因都在这里。
-        val tx = (x.toFloat() * vw / viewW).toInt().coerceIn(0, vw - 1)
-        val ty = (y.toFloat() * vh / viewH).toInt().coerceIn(0, vh - 1)
 
         when {
             down && !touchPressed -> {
                 touchPressed = true
+                gestureStartAt = now
+                gestureMoves = 0
                 downX = tx
                 downY = ty
                 tapStartedAt = now
+                lastTouchAt = now
                 lastMoveX = tx
                 lastMoveY = ty
-                lastTouchAt = now
                 hu.touchDown(tx, ty)
+                logSink?.invoke(
+                    "CARLIFE: 触控 ↓ ($x,$y)→($tx,$ty)（视图 ${viewW}x$viewH）",
+                )
             }
 
             down -> {
-                // 不做本地节流：引擎侧自己有 10ms 限频，这里再丢一次只会让
-                // 拖拽变成「跳跃采样」。发送队列已按「MOVE 只留最新」合并，
-                // 不会积压。
+                // 不做本地节流：引擎 dispatchTouchEvent 自带 10ms 限频，
+                // 本地再丢一次只会让拖拽变成「跳跃采样」。发送队列已按
+                // 「MOVE 只留最新」合并，不会积压。
                 lastTouchAt = now
                 lastMoveX = tx
                 lastMoveY = ty
+                gestureMoves++
                 hu.touchMove(tx, ty)
             }
 
-            !down && touchPressed -> {
-                touchPressed = false
-                lastTouchAt = now
-                // 短促且几乎没有位移 = 点击：用按下点收尾，避免车机端把轻微抖动当拖动、
-                // 或把抬起坐标算到相邻控件上。
+            touchPressed -> {
+                // 短促且几乎没有位移 = 点击：用按下点收尾，避免车机端把轻微抖动
+                // 当拖动、或把抬起坐标算到相邻控件上。
                 val isTap = now - tapStartedAt <= TAP_MAX_MS &&
                     kotlin.math.abs(tx - downX) <= TAP_MAX_DRIFT_PX &&
                     kotlin.math.abs(ty - downY) <= TAP_MAX_DRIFT_PX
-                val ux = if (isTap) downX else tx
-                val uy = if (isTap) downY else ty
-                lastMoveX = ux
-                lastMoveY = uy
-                hu.touchUp(ux, uy)
+                finishGesture(
+                    hu,
+                    if (isTap) downX else tx,
+                    if (isTap) downY else ty,
+                    now,
+                    now - lastTouchAt,
+                    null,
+                )
             }
 
             else -> return true
         }
         touchCount++
-        if (touchCount <= 6 || touchCount % 100 == 0) {
-            val basis = if (hu.videoSizeConfirmed) "SPS" else "协商"
+        if (touchCount % 200 == 0) {
             logSink?.invoke(
-                "CARLIFE: 触控 ($x,$y) → ($tx,$ty) " +
-                    "${if (down) "按下/移动" else "抬起"}（视图 ${viewW}x$viewH → " +
-                    "视频 ${vw}x$vh[$basis]）",
+                "CARLIFE: 触控累计 $touchCount 条（已写入通道 ${hu.sentTouchCount} 条，" +
+                    "坐标观测上限 ${observedMaxX}x${observedMaxY}，视图 ${viewW}x$viewH）",
             )
         }
         return true
     }
+
+    /** 结束一笔手势：发 UP，并按需打印拖动摘要（点击不刷屏）。 */
+    private fun finishGesture(
+        hu: CarLifeHuClient,
+        ux: Int,
+        uy: Int,
+        now: Long,
+        gap: Long,
+        abnormal: String?,
+    ) {
+        touchPressed = false
+        lastTouchAt = now
+        lastMoveX = ux
+        lastMoveY = uy
+        hu.touchUp(ux, uy)
+        val duration = now - gestureStartAt
+        val span = kotlin.math.abs(ux - downX) + kotlin.math.abs(uy - downY)
+        if (abnormal != null) {
+            logSink?.invoke("CARLIFE: $abnormal → 补发 UP ($ux,$uy)")
+        } else if (gestureMoves >= 3 || duration >= 300L) {
+            logSink?.invoke(
+                "CARLIFE: 手势结束 ${gestureMoves}次移动 时长${duration}ms " +
+                    "位移${span}px ↓($downX,$downY) → UP($ux,$uy)",
+            )
+        }
+        gestureMoves = 0
+    }
+
+    /** 新手势间隔：超过这个时长又收到按下，就认定上一笔的 UP 丢了（毫秒）。 */
+    private const val NEW_GESTURE_GAP_MS = 220L
 
     /** 点击判定：按住时长上限（毫秒）。 */
     private const val TAP_MAX_MS = 350L

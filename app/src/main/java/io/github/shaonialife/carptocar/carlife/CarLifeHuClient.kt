@@ -296,11 +296,12 @@ class CarLifeHuClient(
         y: Int,
     ) {
         if (touchOut == null) return
-        // 钳位基准必须是触摸坐标系（SPS 真实分辨率）。用协商档位会把 1920×1080 的坐标
-        // 压回 1279，右侧约三分之一屏幕直接点不到——旧版的「点不准」就是这里造成的。
-        val (limitW, limitH) = videoSize
-        val px = x.coerceIn(0, limitW - 1)
-        val py = y.coerceIn(0, limitH - 1)
+        // 只做安全范围约束，**不按视频分辨率（SPS/协商档位）钳位**：
+        // 触摸坐标的域是「车机 display 坐标」，引擎自己乘 getTouchXOffset() 换算到手机屏。
+        // 以前按 videoSize 钳位，码流 1280×720 而车机画布 1412×654 时，右侧 132 像素
+        // 的点击会被压到 x=1279（整块区域变成同一个点），拖到右侧也拖不动。
+        val px = x.coerceIn(0, TOUCH_COORD_MAX)
+        val py = y.coerceIn(0, TOUCH_COORD_MAX)
         touchLock.lock()
         try {
             if (!running.get()) return
@@ -360,16 +361,29 @@ class CarLifeHuClient(
         y: Int,
     ) {
         val out = touchOut ?: return
-        val (limitW, limitH) = videoSize
-        val px = x.coerceIn(0, limitW - 1)
-        val py = y.coerceIn(0, limitH - 1)
+        val px = x.coerceIn(0, TOUCH_COORD_MAX)
+        val py = y.coerceIn(0, TOUCH_COORD_MAX)
         val frame =
             CarLifeProtocol.packCommand(
                 serviceType,
                 CarLifeProtocol.touchPoint(px, py),
             )
-        runCatching { out.write(frame); out.flush() }
+        sentTouchCount++
+        if (!runCatching { out.write(frame); out.flush() }.isSuccess) {
+            touchWriteFailures++
+            if (touchWriteFailures == 1 || touchWriteFailures % 50 == 0) {
+                log("CARLIFE: 触摸写入失败 ${touchWriteFailures} 次（通道可能已断）")
+            }
+        }
     }
+
+    /** 已下发的触摸报文条数（诊断：确认车机事件真的写进了通道）。 */
+    @Volatile
+    var sentTouchCount = 0
+        private set
+
+    @Volatile
+    private var touchWriteFailures = 0
 
     // ---- 握手 ----
 
@@ -1021,6 +1035,14 @@ class CarLifeHuClient(
          * 只有引擎消费卡住时才会涨，此时丢掉最老的 MOVE 比继续排队更有意义。
          */
         private const val TOUCH_QUEUE_MAX = 8
+
+        /**
+         * 触摸坐标安全上限：**不是**视频分辨率钳位。
+         *
+         * 坐标系是车机 display 坐标，由引擎自己乘 `getTouchXOffset()` 换算到手机屏。
+         * 这里只挡住明显非法的超大值（protobuf varint 无长度限制，但超大坐标无意义）。
+         */
+        private const val TOUCH_COORD_MAX = 8191
 
         /** 单个视频帧上限（1080p 高码率 I 帧实测 < 400KB，留足余量）。 */
         private const val MAX_VIDEO_FRAME = 4 * 1024 * 1024
