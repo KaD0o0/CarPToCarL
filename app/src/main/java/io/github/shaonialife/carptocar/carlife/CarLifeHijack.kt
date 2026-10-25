@@ -76,9 +76,15 @@ object CarLifeHijack {
 
     private val running = AtomicBoolean(false)
 
-    /** 向 CarLife 引擎申请的编码帧率（默认 60，可在偏好 carlife_fps 里改）。 */
+    /**
+     * 向 CarLife 引擎申请的编码帧率（98311 的 fps 字段 + 98316 帧率变更）。
+     *
+     * 初值取 [DEFAULT_FPS]（60）；[start] 时用偏好 `carlife_fps` 覆盖并 clamp 到 3..60。
+     * 这只是「申请值」：荣耀虚拟屏的 `renderFrameRate` 写死 20，实测申请 60 引擎也只吐
+     * 约 20 帧（见 README「已知限制 1」），所以才会有「声明 60 却只有 20fps」的观感。
+     */
     @Volatile
-    private var requestedFps = 20
+    private var requestedFps = DEFAULT_FPS
 
     /** 98386 里的 CONNECT_TYPE（默认 5=WiFi，可在偏好 carlife_connect_type 里改）。 */
     @Volatile
