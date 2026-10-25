@@ -377,6 +377,50 @@ App 侧不需要再改什么：`carlife_fps` 默认就是 **60**，连接建立 
 （N ≥ 3、位移和手指移动距离一致），且不应出现「补发 UP」。  
 出现「补发 UP」说明车机端漏发抬起，那不是本 App 的问题，但补发能保证不死锁。
 
+### 一直连不上 / 车机侧「正在连接」不结束（读不到本机蓝牙 MAC）
+
+现象：App 日志出现 `BT: ⚠ 未能解析真实蓝牙 MAC（仍是占位值）`，RFCOMM 明明连着，
+但 CSM 层再也没有回应，**永远等不到 `0x4301`**；或 WinPlay 类接收端在 SETUP 阶段直接回 `403`。
+
+原因：iAP2 的 `0x4300 bluetoothTransportIdentifier`、`0x4E0E`、AirPlay SETUP 的设备过滤、
+以及 `_carplay-ctrl._tcp` 广播的 TXT id，**都要求本机真实蓝牙 MAC**；
+而 Android 6+ 起应用层拿不到它。车机校验不一致时**不会报错**——链路层照常 ACK，
+CSM 层静默丢弃，看起来就是「一直连不上」。
+
+App 的解析顺序（`util/DeviceIdentity.kt`）：手填 → sysfs → `Settings.Secure` → adapter 反射 → shell。
+
+| 来源 | 普通 App 能否读到 |
+|---|---|
+| **手填**（主界面输入框 +「保存」） | ✅ 永远可用，优先级最高 |
+| `/sys/class/bluetooth/hci0/address` | 多数机型可读（world-readable）；部分 ROM 被 SELinux 拦 |
+| `Settings.Secure` 的 `bluetooth_address` | ❌ 需要 `BLUETOOTH_PRIVILEGED`（只有系统应用有） |
+| `BluetoothAdapter.getAddress()` | ❌ Android 6+ 恒返回 `02:00:00:00:00:00` |
+
+**最可靠的办法是从对端取。** 蓝牙经典（BR/EDR）的 inquiry 响应带的是设备真实 BD_ADDR，
+不像 BLE 那样用随机地址，也不经过手机 framework——**厂商的脱敏管不到它**：
+
+- **车机**：已配对设备列表里显示的那个地址，就是车机眼里的你（最权威，iAP2 校验的就是它）
+- **另一台手机**：装 `nRF Connect` 之类扫描器，让本机停在蓝牙设置页（保持可被发现）扫一下
+- **电脑侧 adb**：`adb shell cat /sys/class/bluetooth/hci0/address`
+  （`adb shell dumpsys bluetooth_manager | grep -i address` 也能试，但部分 ROM 会打码）
+
+拿到后填进 App 主界面输入框点「保存」，日志会打
+`MAC: 本机蓝牙地址已设为 AA:BB:CC:DD:EE:FF（0x4300/SETUP/ctrl 广播都用它）`。
+
+> **能不能把它改成系统应用？** 零售机上基本不行，而且多半白费：
+>
+> - `pm install` 永远只装到 `/data`；进 `/system/priv-app` 需要 root 或可写 system 分区
+>   （即 BL 解锁 + Magisk 模块 / 改 ROM）。零售机 `adb root` 会直接被拒
+>   （`adbd cannot run as root in production builds`）。
+> - 即使塞进 priv-app，Android 9+ 还要求把 `BLUETOOTH_PRIVILEGED` 写进
+>   `/system/etc/permissions/privapp-permissions-*.xml` 白名单，否则开机不授予。
+> - 更关键：priv-app **只有用平台签名才会切到 `platform_app` 的 SELinux 域**。用作者自己的签名，
+>   域仍是 `untrusted_app`，读 sysfs、开 raw HCI socket 一样被拒。
+> - 而且部分机型（含荣耀 MagicOS）的 MAC 在 framework 写入之前就已打码
+>   （连 `dumpsys` 都是 `XX:XX:XX:XX:xx:xx`），**权限再高也读不到真值**。
+>
+> 为读一个地址去刷机不划算——用上面的「从对端取 + 手填」即可。
+
 ### 连接很慢（点了「启动连接」半天没反应）
 
 主要卡在**蓝牙 iAP2 出站**这一步：
