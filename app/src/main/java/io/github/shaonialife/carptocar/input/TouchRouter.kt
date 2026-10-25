@@ -82,13 +82,18 @@ object TouchRouter {
         context: Context,
         contact: Contact,
     ) {
-        // 空闲槽占位（未按下且 0,0）忽略
-        if (!contact.down && contact.xPixels == 0 && contact.yPixels == 0) return
         // CarLife 本地劫持生效时，画面来自手机原生 CarLife（没有虚拟屏可注入），
         // 触摸必须改走 CarLife 的触控通道回传，且不需要 Shizuku。
+        //
+        // 必须放在「空闲槽占位过滤」**之前**：车机抬起时常常把坐标报成 (0,0)，
+        // 旧顺序会把它当成空槽直接 return，于是 UP 永远送不到引擎 —— 引擎侧
+        // eventIng 一直是 true，后续拖拽全部被当成同一次手势的 MOVE，
+        // 表现就是「点一下之后拖不动、只能再点一下复位」。
         if (CarLifeHijack.handleTouch(contact.slot, contact.xPixels, contact.yPixels, contact.down)) {
             return
         }
+        // 空闲槽占位（未按下且 0,0）忽略
+        if (!contact.down && contact.xPixels == 0 && contact.yPixels == 0) return
         val px = (contact.xPixels * coordScaleX).toInt().coerceAtLeast(0)
         val py = (contact.yPixels * coordScaleY).toInt().coerceAtLeast(0)
 

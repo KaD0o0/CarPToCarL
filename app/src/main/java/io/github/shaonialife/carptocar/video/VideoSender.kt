@@ -75,6 +75,24 @@ class VideoSender(
     /** 诊断：最多打印 3 条直通丢帧原因（定位零帧死锁）。 */
     private var diagRejects = 0
 
+    /** 直通模式：最近一个 IDR 的 NAL（空闲时重发，防止车机超时拆链）。 */
+    @Volatile
+    private var lastIdrNals: List<ByteArray>? = null
+
+    /** 最近一次真正写出帧的时刻（uptimeMillis；0 = 还没出过帧）。 */
+    @Volatile
+    private var lastFrameAtMs = 0L
+
+    /** 上一次空闲重发的时刻。 */
+    private var lastIdleResendAt = 0L
+
+    /** 空闲重发次数（日志限频用）。 */
+    private var idleResendCount = 0L
+
+    /** 空闲重发时不打印逐帧日志（否则每秒两行刷屏）。 */
+    @Volatile
+    private var suppressFrameLog = false
+
     /** AES-CTR 密钥流实例：状态必须跨帧连续（每帧新建会导致对端解出乱码）。 */
     private val aesStream: AirPlayCrypto.Aes128CtrStream? =
         (frameCipher as? StreamFrameCipher.AesCtr)?.let { AirPlayCrypto.Aes128CtrStream(it.key, it.iv) }
@@ -199,6 +217,12 @@ class VideoSender(
         passthrough = true
         running.set(true)
         lastKeepAliveAt = android.os.SystemClock.uptimeMillis()
+        // 新一轮会话：上一轮的「最后一帧」不能拿来重发（车机解码器已重建，
+        // 旧 IDR 的 SPS/PPS 与本轮 avcC 可能不一致）。
+        lastIdrNals = null
+        lastFrameAtMs = 0L
+        lastIdleResendAt = 0L
+        idleResendCount = 0L
         log("VIDEO: 直通模式启动（外部 H.264，跳过重编码）${width}x$height")
         Thread({ passthroughKeepAliveLoop() }, "video-passthrough-ka").apply {
             isDaemon = true
@@ -212,6 +236,7 @@ class VideoSender(
             while (running.get()) {
                 val output = socket?.getOutputStream() ?: return
                 maybeSendKeepAlive(output)
+                maybeResendIdleFrame(output)
                 Thread.sleep(200)
             }
         } catch (error: Exception) {
@@ -221,6 +246,40 @@ class VideoSender(
             // 表现为「车机重连了但画面永远不再出现」（2026-10-24 日志实测）。
             stop()
             log("VIDEO: 直通通道已失效——等待车机重新建立会话")
+        }
+    }
+
+    /**
+     * 空闲保活：CarLife 不再出帧时，周期性重发**最后一个 IDR**。
+     *
+     * 车机侧只要视频流静默太久就判定「源断了」并拆整轮会话（2026-10-25 日志实测：
+     * 音频一直在推、视频 0 帧超过 ~30s，车机发 EOF 断开）。CarLife 不产帧的常见
+     * 原因是它自己的虚拟屏上没内容（用户还没在 CarLife+ 里点「无线连接」），
+     * 但此时**音频和触摸其实都还活着**——被拆掉纯属浪费。
+     *
+     * 重发 IDR 而不是最后一帧 P 帧：IDR 自包含，重复解码只会得到同一幅画面；
+     * P 帧重复会让车机按错误参考帧叠加，出现花屏。
+     */
+    private fun maybeResendIdleFrame(output: java.io.OutputStream) {
+        val nals = lastIdrNals ?: return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (lastFrameAtMs == 0L || now - lastFrameAtMs < IDLE_RESEND_AFTER_MS) return
+        if (now - lastIdleResendAt < IDLE_RESEND_INTERVAL_MS) return
+        lastIdleResendAt = now
+        suppressFrameLog = true
+        try {
+            sendFrameFromNals(nals, true, output)
+            idleResendCount++
+            if (idleResendCount == 1L || idleResendCount % 30L == 0L) {
+                log(
+                    "VIDEO: 已 ${(now - lastFrameAtMs) / 1000}s 没有新画面——重发最后一个 IDR " +
+                        "维持车机连接（第 $idleResendCount 次）",
+                )
+            }
+        } catch (error: Exception) {
+            log("VIDEO: 空闲保活重发失败 - ${error.message}")
+        } finally {
+            suppressFrameLog = false
         }
     }
 
@@ -258,6 +317,10 @@ class VideoSender(
                 sendConfigFromNals(nalUnits, output)
             }
             sendFrameFromNals(nalUnits, keyFrame, output)
+            lastFrameAtMs = android.os.SystemClock.uptimeMillis()
+            if (keyFrame || nalUnits.any { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 5 }) {
+                lastIdrNals = nalUnits
+            }
             true
         } catch (error: Exception) {
             log("VIDEO: 直通送帧失败 - ${error.message}")
@@ -641,7 +704,7 @@ class VideoSender(
         framesSent++
         framesSinceKeepAlive++
         bytesSinceKeepAlive += plain.size.toLong()
-        if (keyFrame || framesSent <= 3 || framesSent % 150 == 0L) {
+        if (!suppressFrameLog && (keyFrame || framesSent <= 3 || framesSent % 150 == 0L)) {
             log("VIDEO: 帧 #$framesSent ${plain.size}B${if (keyFrame) " (key)" else ""} 已发送")
         }
     }
@@ -732,6 +795,12 @@ class VideoSender(
 
         /** 屏幕流 keepAlive 间隔（catplay `DEFAULT_KEEP_ALIVE` = 1s）。 */
         private const val KEEPALIVE_INTERVAL_MS = 1_000L
+
+        /** 直通空闲多久后开始重发 IDR（毫秒）。 */
+        private const val IDLE_RESEND_AFTER_MS = 1_500L
+
+        /** 空闲重发间隔（毫秒）：2s 一次足够撑住车机的存活判定，也不会白烧带宽。 */
+        private const val IDLE_RESEND_INTERVAL_MS = 2_000L
 
         /**
          * 构造屏幕流 keepAlive 帧（明文头 + 可选 bplist 统计体）。

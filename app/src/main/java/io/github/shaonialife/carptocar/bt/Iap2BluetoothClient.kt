@@ -51,6 +51,9 @@ class Iap2BluetoothClient(
         private const val RETRY_DELAY_MILLIS = 3_000L
         private const val FAILURE_LOG_THROTTLE_MILLIS = 15_000L
 
+        /** 目标连不上多少轮后放开限制（3s/轮 → 约 6s 后回退，旧行为要等 40s+）。 */
+        private const val TARGET_FALLBACK_ROUNDS = 2
+
         /** 「蓝牙已连接→已断开」日志节流（车机可能反复自动重连，避免刷屏）。 */
         private const val PROFILE_LOG_THROTTLE_MILLIS = 15_000L
 
@@ -178,6 +181,7 @@ class Iap2BluetoothClient(
         // 每轮启动重置 SDP 结论与跳过日志（新配对/换固件后重新探测）
         iap2ServiceCache.clear()
         skippedNoService.clear()
+        BtSessionGate.targetSoftFallback = false
         running = true
         val myGeneration = generation.incrementAndGet()
         val target = targetProvider()
@@ -206,6 +210,7 @@ class Iap2BluetoothClient(
                 null
             } ?: return
         var lastFailureLogAt = 0L
+        var targetFailRounds = 0
         while (running && generation.get() == myGeneration) {
             // 静默降噪（2026-10-10 用户实测后启用）——会话期间完全静默，不产生任何连接尝试/日志：
             //  - inboundActive：接收端正在连我们（两条 RFCOMM 会互相踩；Audi 实测双会话混乱）
@@ -275,6 +280,18 @@ class Iap2BluetoothClient(
                 }
             }
             if (connected == null) {
+                // 目标连续连不上 → 放开目标限制（见 BtSessionGate.targetSoftFallback）。
+                // 只在「用户指定了目标」时计数，且只降级一次。
+                if (targetProvider() != null && !BtSessionGate.targetSoftFallback) {
+                    targetFailRounds++
+                    if (targetFailRounds >= TARGET_FALLBACK_ROUNDS) {
+                        BtSessionGate.targetSoftFallback = true
+                        log(
+                            "BT-C: 目标「${targetProvider()?.name}」连续 $targetFailRounds 轮连不上" +
+                                "——本轮放开目标限制，任一已配对车机连入都接受（不必等它）",
+                        )
+                    }
+                }
                 sleepQuietly(RETRY_DELAY_MILLIS)
                 continue
             }
@@ -306,18 +323,28 @@ class Iap2BluetoothClient(
             // 目标策略：地址命中即唯一候选——不再按 SDP 缓存过滤（缓存可能缺失，
             // 而用户显式指定就该尝试）；目标不在已配对列表时给一次提示并空转等待。
             val hit = bonded.filter { TargetDevicePrefs.matches(target, it.address) }
-            if (hit.isEmpty()) {
-                val now = android.os.SystemClock.uptimeMillis()
-                if (now - lastTargetMissingLogAt > FAILURE_LOG_THROTTLE_MILLIS) {
-                    lastTargetMissingLogAt = now
-                    log(
-                        "BT-C: 目标设备「${target.name}」(${target.address}) 不在已配对列表" +
-                            "——请到系统蓝牙设置完成配对，或在「连接准备」改选目标",
-                    )
+            if (!BtSessionGate.targetSoftFallback) {
+                if (hit.isEmpty()) {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (now - lastTargetMissingLogAt > FAILURE_LOG_THROTTLE_MILLIS) {
+                        lastTargetMissingLogAt = now
+                        log(
+                            "BT-C: 目标设备「${target.name}」(${target.address}) 不在已配对列表" +
+                                "——请到系统蓝牙设置完成配对，或在「连接准备」改选目标",
+                        )
+                    }
+                    return emptyList()
                 }
-                return emptyList()
+                return hit
             }
-            return hit
+            // 软回退：目标降级为「优先」，其余已配对设备一并作为候选
+            // （按 UUID 提示有 iAP2 服务的排前面，减少无谓的连接尝试）。
+            val ranked =
+                bonded.sortedWith(
+                    compareByDescending<BluetoothDevice> { TargetDevicePrefs.matches(target, it.address) }
+                        .thenByDescending { d -> d.uuids?.any { it.uuid == ACCESSORY_IAP2_UUID } == true },
+                )
+            return ranked
         }
         val withService =
             bonded.filter { device ->
@@ -422,4 +449,19 @@ object BtSessionGate {
      */
     @Volatile
     var sessionActive: Boolean = false
+
+    /**
+     * 目标设备软回退：指定了目标车机但连续多轮连不上时置位。
+     *
+     * 场景：用户上次连的是 A 车（配了目标），这次坐的是 B 车 / 测试台。
+     * 旧行为是**死等目标**——出站只试目标、入站把非目标全部掐掉，
+     * 用户体感就是「点了启动连接，四十多秒毫无反应」（2026-10-25 日志实测
+     * 17:48:47 启动 → 17:49:30 才连上）。置位后目标降级为「优先」：
+     * 出站回退到全部已配对设备，入站也不再拒绝。
+     *
+     * 每次 `connect()` 重新开始都会清零，所以真车场景只要目标在窗口内可达，
+     * 行为与旧版完全一致。
+     */
+    @Volatile
+    var targetSoftFallback: Boolean = false
 }

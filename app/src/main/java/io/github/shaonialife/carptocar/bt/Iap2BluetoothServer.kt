@@ -128,7 +128,10 @@ class Iap2BluetoothServer(
                 } catch (_: SecurityException) {
                     null
                 }
-            if (target != null && !TargetDevicePrefs.matches(target, peerAddress)) {
+            if (target != null &&
+                !BtSessionGate.targetSoftFallback &&
+                !TargetDevicePrefs.matches(target, peerAddress)
+            ) {
                 log(
                     "BT: 忽略非目标设备连入 name=$peerName addr=${peerAddress ?: "?"}" +
                         "（当前目标：「${target.name}」）",
