@@ -19,7 +19,7 @@
 
 | 项    | 值                                                                             |
 | ---- | ----------------------------------------------------------------------------- |
-| 当前版本 | `1.0.1`（1.0.0 正式版的补丁：修「CarPlay 不断、CarLife 重连后黑屏」；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
+| 当前版本 | `1.0.1`（正式版；修「CarPlay 不断、CarLife 重连后黑屏」；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
 | 包名   | `io.github.shaonialife.carptocar`                                             |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                                     |
 | 最低系统 | Android 12（minSdk 31，targetSdk 34）                                            |
@@ -697,7 +697,7 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 
 ## 十一、版本历史
 
-### 1.0.1 —— 2026-10-25（补丁 / 测试）
+### 1.0.1 —— 2026-10-25（正式版 · 补丁）
 
 **修：CarPlay 会话保持时，CarLife 断开重连后车机不再出画面。**
 
@@ -707,6 +707,11 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 - 源重启后 4 秒零帧 → 自动请求引擎重建编码器（补 SPS+PPS+IDR）。
 - `seedCsd()`：车机重新接上通道时先用缓存 SPS/PPS 预置 csd，缩掉「等引擎重建」的黑屏窗口。
 - `frameCounter` 明确不归零（同一条流 nonce 不能复用），见第五节排查小节。
+
+**诊断可读性**
+
+- 蓝牙会话收尾按 `BtSessionGate.sessionActive` 区分「iAP2 已迁到 WiFi 隧道（正常）」与
+  「端点未拿到就断开（故障）」两种文案，不再把 WinPlay 的正常交接写成「等待接收端重连」。
 
 ### 1.0.0 —— 2026-10-25（首个正式版）
 
