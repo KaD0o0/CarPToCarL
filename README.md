@@ -15,11 +15,33 @@
 
 ---
 
+## 立即下载
+
+**最新正式版**（免编译，直接装）：
+
+> **[`CarPToCarL-latest.apk`](https://github.com/jjuugk/CarPToCarL/releases/latest/download/CarPToCarL-latest.apk)**
+> —— 固定直链，永远指向最新一版（当前 1.0.2，13.2 MB）
+
+| 项        | 值                                                                              |
+| -------- | ------------------------------------------------------------------------------ |
+| 全部版本     | [Releases 页面](https://github.com/jjuugk/CarPToCarL/releases)（含更新日志与历史版本）        |
+| 本版固定包    | [`CarPToCarL-1.0.2-release.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.0.2/CarPToCarL-1.0.2-release.apk) |
+| 系统要求     | Android 12 及以上（minSdk 31）                                                      |
+| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 / 1.0.1，但不要与其它来源的包混装                    |
+| 安装       | 系统安装器直接装，或 `adb install -r CarPToCarL-latest.apk`                              |
+| 前置       | 手机需装 **CarLife+**（荣耀机型为 `com.baidu.carlife.honor`）                             |
+
+首次启动会弹出免责声明，需手动同意。装好后怎么配、常见故障怎么查，见
+[第三节 使用说明](#三使用说明)与[第五节 故障排查](#五故障排查)。
+
+---
+
 ## 一、项目简介
 
 | 项    | 值                                                                             |
 | ---- | ----------------------------------------------------------------------------- |
 | 当前版本 | `1.0.2`（正式版；说明里标注源自 CarDeck，功能同 1.0.1；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
+| 下载   | **[最新正式版 APK](https://github.com/jjuugk/CarPToCarL/releases/latest)**（见上方「立即下载」）       |
 | 包名   | `io.github.shaonialife.carptocar`                                             |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                                     |
 | 最低系统 | Android 12（minSdk 31，targetSdk 34）                                            |
@@ -564,7 +586,10 @@ adb shell "run-as io.github.shaonialife.carptocar cat files/main_debug.log"
   指向 `../cardeck/.tools`（Windows 目录 junction，共享工具链，省 ~870MB）。
 - `init-mirror.gradle` 把依赖源指向腾讯云镜像（`google()` / `mavenCentral()` 本机易超时）。
 - 产物：debug → `app/build/outputs/apk/debug/app-debug.apk`；  
-  release → `app/build/outputs/apk/release/app-release.apk`。
+  release → `app/build/outputs/apk/release/app-release.apk`（归档到 `dist/`，`dist/` 不入版本库）。
+- **不自己编译也行**：正式包在各版本的
+  [Releases](https://github.com/jjuugk/CarPToCarL/releases) 页面直接下载，
+  固定直链 <https://github.com/jjuugk/CarPToCarL/releases/latest/download/CarPToCarL-latest.apk> 始终指向最新版。
 
 ### 安装与调试
 
@@ -735,6 +760,9 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 ## 十一、版本历史
 
 ### 1.0.2 —— 2026-10-25（正式版 · 合规补充）
+
+**[下载](https://github.com/jjuugk/CarPToCarL/releases/tag/v1.0.2)** ——
+`CarPToCarL-1.0.2-release.apk` / [`CarPToCarL-latest.apk`](https://github.com/jjuugk/CarPToCarL/releases/latest/download/CarPToCarL-latest.apk)
 
 **把「来自哪里」写进说明**
 
