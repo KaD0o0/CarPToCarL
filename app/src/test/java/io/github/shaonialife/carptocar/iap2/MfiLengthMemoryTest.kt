@@ -23,8 +23,8 @@ class MfiLengthMemoryTest {
         val b = MfiLengthMemory.receiverKey("Audi_MMI_0000  AUDI 0000 DELPHI")
         assertEquals(a, b)
         assertTrue(a.matches(Regex("[a-z0-9_]+")))
-        // 不同车机必须落到不同键（3315 与 6318 不能互相污染记忆）
-        assertFalse(a == MfiLengthMemory.receiverKey("audi_mmi_0000 audi 0000 delphi"))
+        // 不同车机必须落到不同键（型号或厂商不同都不能互相污染记忆）
+        assertFalse(a == MfiLengthMemory.receiverKey("audi_mmi_0000 audi 0000 continental"))
     }
 
     @Test

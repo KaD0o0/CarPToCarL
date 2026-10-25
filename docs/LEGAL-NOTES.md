@@ -69,7 +69,10 @@
   （`.tools/`、`carlife-ref/`、`*.dex`、`*.jks` 均在 `.gitignore`）；
 - 真实热点密码只存在于运行时内存，日志里一律 `psk=***`；
 - 测试与文档里的车机名 / MAC 已脱敏为 `Audi_MMI_0000` / `AA:BB:CC:DD:EE:FF` /
-  `DESKTOP-XXXXXXX`；
+  `DESKTOP-XXXXXXX`；多个真实型号统一折叠成 `0000`，所以正文里出现同名的
+  「Audi MMI 0000」可能指不同年款，靠上下文（日期 / 行为差异）区分；
+- **历史提交已重写**（2026-10-25，首次推送到 GitHub 之前用 `filter-branch` 跑同一份脱敏脚本），
+  旧提交里的原始车机名 / MAC 不会随 `git log` 一起公开；
 - 依赖全部是 Apache-2.0 / MIT 系（AndroidX、Kotlin、BouncyCastle），无 GPL 传染；
   第三方声明见 [NOTICE](../NOTICE)，并已随二进制打进 APK 的 `assets/NOTICE.txt`。
 
