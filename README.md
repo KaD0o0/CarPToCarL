@@ -75,6 +75,8 @@
   **DiPlay 是 xcertplay 的衍生版，是本项目实际使用的测试台**。
 - 发送端**不需要苹果签名身份**：iAP2 认证是单向的（手机验证车机的 MFi 证书，车机信任手机自报结果）。
 - **有线 USB 路线已排除**（App 无法控制 USB gadget，测试机 BL 无法解锁），只走无线。
+  卡在哪一层、三条可能的绕法（root 手搓 gadget / 树莓派当 USB 翻译器 / 等 dongle）、
+  将来若要做该怎么起步，见 [docs/WIRED-CARPLAY-FEASIBILITY.md](docs/WIRED-CARPLAY-FEASIBILITY.md)。
 
 ### 背景：为什么需要它
 
