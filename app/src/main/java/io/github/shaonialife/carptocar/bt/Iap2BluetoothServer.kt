@@ -173,7 +173,20 @@ class Iap2BluetoothServer(
             senderSession = null
             BtSessionGate.inboundActive = false
             channel.close()
-            log("SESSION 结束，等待接收端重连（BT 监听仍在运行）")
+            // 两条完全不同的撤退路径，日志必须能分辨（否则用户以为「蓝牙连上就断 = App 有 bug」）：
+            //  - sessionActive=true：AirPlay 已在 WiFi 上跑起来，接收端把 iAP2 迁到控制通道
+            //    隧道（VirtualIap2Link）后**主动关掉 RFCOMM**。WinPlay 1.2.4 实测：
+            //    20:07:31 连入 → 20:07:32.4 隧道建立 → 32.52 对端 close（read -1）。
+            //    这是无线 CarPlay 的正常交接，画面/音频/触摸全程不受影响。
+            //  - sessionActive=false：会话在拿到端点前就断了，才是真故障，等重连。
+            log(
+                if (BtSessionGate.sessionActive) {
+                    "SESSION 结束——接收端已断开 RFCOMM，iAP2 已迁到 WiFi 隧道" +
+                        "（无线 CarPlay 正常交接，继续推流；BT 监听仍在，需要时会再连）"
+                } else {
+                    "SESSION 结束，等待接收端重连（BT 监听仍在运行）"
+                },
+            )
         }
     }
 
