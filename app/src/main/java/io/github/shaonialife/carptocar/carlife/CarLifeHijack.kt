@@ -335,6 +335,9 @@ object CarLifeHijack {
             snapshot
         }
         sender = videoSender
+        // 缓存里的 SPS/PPS 先交给视频层：即使下面一帧都补不出来（缓存为空 / 新会话首帧
+        // 是裸 P 帧），第一个到达的帧也能立刻发出 VideoConfig，不必干等引擎重建编码器。
+        spsPps?.let { videoSender.seedCsd(it) }
         startFirstFrameWatchdog(videoSender)
         if (pending.isEmpty()) {
             log("CARLIFE: 尚无可补的历史帧（缓存为空），等待 CarLife 推流…")
@@ -454,6 +457,14 @@ object CarLifeHijack {
                 client = hu
                 // 会话建立前缓存过 SPS：立刻用它校准触摸基准，别等下一帧关键帧。
                 spsPps?.let { hu.seedSps(it) }
+                // CarPlay 会话仍在、CarLife 换了一轮（引擎掉线重连 / 用户重开「无线连接」）：
+                // 车机手里的 avcC 与参考帧都是上一轮的，必须让视频层重发 VideoConfig、
+                // 并等到新 IDR 再送帧，否则「CarPlay 不掉、CarLife 重连后永久没画面」
+                // （2026-10-25 用户实测）。首次劫持时 sender 还是 null，这里是空操作。
+                if (sender != null) {
+                    sender?.onSourceRestart("CarLife 会话重建（引擎重连）")
+                    startSourceRestartWatchdog(hu)
+                }
                 logSink?.invoke("CARLIFE: 劫持成功，已接管本机 CarLife 码流（等待连接车机）")
             } else {
                 logSink?.invoke("CARLIFE: 握手失败，2 秒后重试（确认 CarLife 停在「正在连接」）")
@@ -468,6 +479,28 @@ object CarLifeHijack {
             hasVideo = false
             if (running.get()) sleep(1500)
         }
+    }
+
+    /**
+     * 源重启后 4 秒仍一帧都没送进车机 → 请求引擎重建编码器。
+     *
+     * 覆盖的是「新会话的首个 IDR 不带 SPS/PPS」这种边角：`VideoSender` 没有可用 csd
+     * 就发不出 VideoConfig，帧被逐帧丢弃，看起来又是「重连后一直黑屏」。引擎重建后
+     * 必然发「SPS+PPS+IDR」，链路自愈。与 [startFirstFrameWatchdog] 的区别：
+     * 那个只在「车机刚接上通道」时跑一次，这里的触发点每次 CarLife 会话重建都会重新计。
+     */
+    private fun startSourceRestartWatchdog(hu: CarLifeHuClient) {
+        val base = framesDelivered
+        Thread {
+            try {
+                Thread.sleep(4_000)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            if (!running.get() || client !== hu || framesDelivered > base) return@Thread
+            logSink?.invoke("CARLIFE: 源重启后 4 秒零帧——请求引擎重建编码器（约 1 秒后出 SPS+IDR）")
+            hu.requestVideoReinit()
+        }.apply { isDaemon = true }.start()
     }
 
     /** 一节视频帧：有会话就直通，没有就缓存（从关键帧开始）。 */

@@ -101,6 +101,32 @@ class VideoSender(
     @Volatile
     private var lastIdrNals: List<ByteArray>? = null
 
+    /**
+     * 最近一次成功发出的 csd（SPS/PPS NAL，含 NAL 头、不含起始码）。
+     *
+     * CarLife 换一轮会话后，新编码器**未必**在首个 IDR 里带 SPS/PPS；此时若手上没有
+     * 缓存就发不出 VideoConfig，`configSent` 永远 false → 每一帧都被丢弃。
+     * 缓存它就能在源重启后立刻用旧参数重发 config 兜底（新 SPS 到达时再覆盖）。
+     */
+    @Volatile
+    private var cachedCsd: List<ByteArray>? = null
+
+    /** 已发出的 SPS 字节（用于识别「源换了分辨率/档位」→ 必须重发 VideoConfig）。 */
+    @Volatile
+    private var sentSps: ByteArray? = null
+
+    /**
+     * 源重启后先等一个 IDR 再恢复送帧。
+     *
+     * 新一源码流的参考帧与上一轮毫无关系，此时把 P 帧塞给车机解码器只会拿旧参考帧
+     * 去叠，画面花屏或干脆黑住——直到下一个 IDR 才自愈。这里直接挡掉。
+     */
+    @Volatile
+    private var awaitingKeyFrameAfterRestart = false
+
+    /** 源重启后被挡掉的非 IDR 帧数（诊断）。 */
+    private var droppedBeforeRestartKey = 0L
+
     /** 最近一次真正写出帧的时刻（uptimeMillis；0 = 还没出过帧）。 */
     @Volatile
     private var lastFrameAtMs = 0L
@@ -182,6 +208,9 @@ class VideoSender(
                 configSent = false
                 frameCounter = 0L
                 lastIdrNals = null
+                // 新通道 = 接收端重建解密与解码状态：同样要等一个 IDR 再喂帧。
+                awaitingKeyFrameAfterRestart = true
+                droppedBeforeRestartKey = 0
             }
             var attempt = 0
             while (running.get() && attempt < DATA_RECONNECT_ATTEMPTS) {
@@ -294,6 +323,12 @@ class VideoSender(
         lastFrameAtMs = 0L
         lastIdleResendAt = 0L
         idleResendCount = 0L
+        // 新会话：上一轮的 csd/config 指纹一律作废。
+        cachedCsd = null
+        sentSps = null
+        configSent = false
+        awaitingKeyFrameAfterRestart = false
+        droppedBeforeRestartKey = 0
         log("VIDEO: 直通模式启动（外部 H.264，跳过重编码）${width}x$height")
         Thread({ passthroughKeepAliveLoop() }, "video-passthrough-ka").apply {
             isDaemon = true
@@ -368,6 +403,53 @@ class VideoSender(
      * 提交一帧外部 H.264（AnnexB，含 00 00 00 01 起始码）。
      * 首次遇到含 SPS/PPS 的帧时自动发 VideoConfig；返回 false 表示被丢弃。
      */
+    /**
+     * **CarLife 源重启**：引擎断开重连 / 用户重开一次「无线连接」时由劫持层调用。
+     *
+     * 场景（2026-10-25 用户实测）：CarPlay 会话一直保持，手机端 CarLife 掉线重连后，
+     * 车机再也收不到画面。原因是 `VideoSender` 的会话级状态没跟着源一起重置：
+     *
+     * - `configSent` 仍是 true → 新码流的 VideoConfig 永远不会再发。新车机解码器 /
+     *   已重建的解码器手里是上一轮的 avcC，新 SPS 一比就废（改过分辨率时更必然）。
+     * - 旧 `lastIdrNals` 还在 → 空闲保活会把**上一轮的 IDR** 反复送给车机。
+     * - 旧源的参考帧与新的完全无关 → 新源开头那几个 P 帧解出来就是花屏。
+     *
+     * 所以这里清配置态、丢掉旧 IDR、并在新 IDR 到来前拒收 P 帧。
+     *
+     * ⚠️ **`frameCounter` 绝不能归零**：仍是同一条 AirPlay 视频流、同一把 key，
+     * 计数器归零 = ChaCha/AES 的 nonce 复用，车机侧 AEAD 校验必然失败，
+     * 表现就是「重连后一帧都过不去」。只有换整轮会话（新 SETUP）才允许归零。
+     */
+    fun onSourceRestart(reason: String) {
+        if (!running.get()) return
+        configSent = false
+        awaitingKeyFrameAfterRestart = true
+        droppedBeforeRestartKey = 0
+        // 不在这里清 lastIdrNals：源重启到新源出首帧之间可能有几秒空窗，
+        // 旧 IDR 还能继续喂保活，避免车机因「视频静默」拆掉整轮会话。
+        // 一旦真的发出新 config，sendConfigFromNals 会立刻把它作废。
+        lastFrameAtMs = android.os.SystemClock.uptimeMillis()
+        log("VIDEO: 检测到 CarLife 源重启（$reason）——重置配置、等待新 IDR（帧计数保持，nonce 不复用）")
+    }
+
+    /**
+     * 用上层缓存的 SPS/PPS（AnnexB，含起始码）预置 csd。
+     *
+     * 用于「车机重新接上通道、但手上没有带 SPS 的关键帧」：此前只能干等引擎下一次
+     * 编码器重建（4s 看门狗）才发得出 VideoConfig，这段时间车机就是黑屏。
+     * 预置后第一帧（哪怕是 P 帧）就能把 config 发出去，最快一个 IDR 周期就有画面。
+     *
+     * 已有 csd 时不覆盖：真实码流里的 SPS 永远比缓存更可信。
+     */
+    fun seedCsd(annexB: ByteArray) {
+        if (cachedCsd != null) return
+        val nals = splitAnnexB(annexB)
+        val sps = nals.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 7 } ?: return
+        val pps = nals.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 8 } ?: return
+        cachedCsd = listOf(sps, pps)
+        log("VIDEO: 已用缓存 SPS/PPS 预置 csd（${sps.size}B/${pps.size}B）")
+    }
+
     fun submitH264(data: ByteArray, keyFrame: Boolean): Boolean {
         if (!running.get()) return false
         val output = try {
@@ -385,17 +467,44 @@ class VideoSender(
                 return false
             }
             val hasSps = nalUnits.any { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 7 }
+            val isIdr = nalUnits.any { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 5 }
+            if (awaitingKeyFrameAfterRestart) {
+                if (!isIdr) {
+                    droppedBeforeRestartKey++
+                    if (droppedBeforeRestartKey == 1L || droppedBeforeRestartKey % 30 == 0L) {
+                        log("VIDEO: 源重启后等新 IDR——已跳过 $droppedBeforeRestartKey 个非关键帧")
+                    }
+                    return false
+                }
+                awaitingKeyFrameAfterRestart = false
+                log("VIDEO: 源重启后收到新 IDR——恢复送帧（重发 VideoConfig）")
+            }
+            // 会话中途 SPS 变了（用户在车联里改分辨率 / 引擎重建编码器）：
+            // 车机手里的 avcC 已经不对，必须重发一份新的。
+            if (configSent && hasSps && !spsMatchesSent(nalUnits)) {
+                log("VIDEO: 检测到 SPS 变化——重发 VideoConfig（分辨率/档位已变）")
+                configSent = false
+            }
             if (!configSent && diagRejects < 3) {
                 diagRejects++
                 log("VIDEO: 等 SPS 中——本帧 NAL 类型=" +
                     nalUnits.joinToString(",") { "${it[0].toInt() and 0x1F}" } + " hasSps=$hasSps")
             }
             if (!configSent) {
-                if (!hasSps) {
-                    droppedBeforeConfig++
-                    return false
+                if (hasSps) {
+                    sendConfigFromNals(nalUnits, output)
+                } else {
+                    // 新源的首个 IDR 没带 SPS/PPS：用上一轮缓存的 csd 兜底重发。
+                    // 没这层兜底就是「configSent 永远 false → 每帧丢弃 → 永久黑屏」。
+                    val csd = cachedCsd
+                    if (csd != null) {
+                        log("VIDEO: 新 IDR 未携带 SPS/PPS——用缓存 csd 重发 VideoConfig")
+                        sendConfigFromNals(csd, output)
+                    } else {
+                        droppedBeforeConfig++
+                        return false
+                    }
                 }
-                sendConfigFromNals(nalUnits, output)
             }
             sendFrameFromNals(nalUnits, keyFrame, output)
             lastFrameAtMs = android.os.SystemClock.uptimeMillis()
@@ -521,6 +630,13 @@ class VideoSender(
         sendConfigFromNals(splitAnnexB(annexB), output)
     }
 
+    /** 本帧携带的 SPS 是否与已发出的那份一致（true = 无需重发 config）。 */
+    private fun spsMatchesSent(nalUnits: List<ByteArray>): Boolean {
+        val sps = nalUnits.firstOrNull { it.isNotEmpty() && (it[0].toInt() and 0x1F) == 7 } ?: return true
+        val sent = sentSps ?: return false
+        return sent.contentEquals(sps)
+    }
+
     /** 从一组 NAL 里取 SPS/PPS 组装 avcC 并发出 VideoConfig。 */
     private fun sendConfigFromNals(
         nalUnits: List<ByteArray>,
@@ -532,6 +648,11 @@ class VideoSender(
             log("VIDEO: csd 缺少 SPS/PPS（${nalUnits.size} 个 NAL），跳过 config")
             return
         }
+        // 记住这份 csd：源重启后新 IDR 若不带 SPS/PPS，靠它兜底重发 config。
+        cachedCsd = listOf(sps, pps)
+        sentSps = sps.copyOf()
+        // 换参数后旧 IDR 与新车机 avcC 不再匹配，不能再用它做空闲重发。
+        lastIdrNals = null
         // 关键：VideoConfig 头部声明的宽高**必须与车机解码器画布一致**，否则真车
         // （Audi/DELPHI）按声明画布建解码器后解不出画面（概率性黑屏，2026-10-19 实测）。
         //
