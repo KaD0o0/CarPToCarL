@@ -573,8 +573,9 @@ CarPToCarL/
 ├── gradle.properties             # JVM 参数 + org.gradle.java.home（固定 JDK 17）
 ├── keystore.properties.example   # 签名配置模板
 ├── .editorconfig                 # Kotlin/ktlint 代码风格
-├── LICENSE                       # MIT
-├── DISCLAIMER.md                 # 免责声明
+├── LICENSE                       # MIT + 授权范围说明（不授予第三方协议/专利）
+├── NOTICE                        # 第三方组件、商标与构建期依赖声明
+├── DISCLAIMER.md                 # 使用风险与驾驶安全
 └── README.md                     # 本文档
 ```
 
@@ -587,6 +588,7 @@ CarPToCarL/
 | [docs/carlife-wireless-verification.md](docs/carlife-wireless-verification.md) | 无线链路验证记录                  |
 | [docs/PROTOCOL-NOTES.md](docs/PROTOCOL-NOTES.md)                               | iAP2 / AirPlay 协议依据       |
 | [docs/CARLIFE-GATEWAY-FEASIBILITY.md](docs/CARLIFE-GATEWAY-FEASIBILITY.md)     | 网关方案可行性评估                 |
+| [docs/LEGAL-NOTES.md](docs/LEGAL-NOTES.md)                                     | 开源 / 收费的法律风险梳理与商业化清单      |
 
 ### 主源码包结构（`app/src/main/java/io/github/shaonialife/carptocar/`）
 
@@ -672,7 +674,7 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 ## 九、签名与发布
 
 - **版本号**：`app/build.gradle.kts` 顶部 `appVersionName` 是唯一来源，`versionCode` 自动推导  
-  （`1.0.0` → `10000`；旧实验版 `0.2.19` → `219`，升级路径连续）。
+  （`1.0.1` → `10001`，`1.0.0` → `10000`；旧实验版 `0.2.19` → `219`，升级路径连续）。
 - **签名**：release 默认退回 debug 签名；正式分发前配置真实签名：
   1. 复制 `keystore.properties.example` → `keystore.properties`（已 gitignore）
   2. `keytool -genkeypair -v -keystore carptocar-release.jks -alias carptocar -keyalg RSA -keysize 4096 -validity 10000`
@@ -684,13 +686,25 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 
 ---
 
-## 十、边界与商标
+## 十、边界、商标与合规
 
-- **许可证**：源码以 [MIT](LICENSE) 发布。`reference/` 下参考项目（GPL-3.0 等）  
-  已被 `.gitignore` 排除、不随仓库分发；本项目为独立实现，仅参考公开协议格式与真机抓包。
-- 应用名为 **CarPToCarL**，**不含**任何第三方商标。
-- 「CarPlay」「AirPlay」「CarLife」均为其权利人的商标，文中出现仅作**描述性引用**。
-- 本项目**不使用** Apple、百度或任何车厂的图形标识与认证标（含 MFi）。
+- **许可证**：源码以 [MIT](LICENSE) 发布，正文之后附了一段**授权范围说明**：MIT 只授予
+  本仓库代码的著作权，**不授予** Apple / 百度的专利、协议规范、MFi 认证或任何商标权利。
+- **第三方组件**：AndroidX / Kotlin（Apache-2.0）、BouncyCastle（MIT 系）的版权声明见
+  [NOTICE](NOTICE)；同一份文件（外加 LICENSE）已打包进 APK 的 `assets/`，
+  随二进制一起分发。
+- **风险梳理**：开源与「收费」各自的风险、以及商业化前的三件套（经营主体 / App 备案 /
+  隐私政策），见 [docs/LEGAL-NOTES.md](docs/LEGAL-NOTES.md)。
+  > 结论先写在这里：**开源可以继续；收费只做「赞助 / 技术支持」，不要把 APK 或订阅当商品卖。**
+  > 卖软件会让「被要求下架」升级为「可主张赔偿」，而 MFi 认证与 iAP2 协议这两块，
+  > 本项目的 MIT 授权一点都不覆盖。
+- 应用名为 **CarPToCarL**，**不含**任何第三方商标；已配对的真车 / 电脑名称一律不写进仓库
+  （文档与测试里是 `Audi_MMI_0000` / `AA:BB:CC:DD:EE:FF` 这类占位值）。
+- 「CarPlay」「AirPlay」「CarLife」「MMI」「MagicOS」均为其权利人的商标，文中出现仅作
+  **描述性引用**，不代表任何关联、授权或认证。
+- 本项目**不使用** Apple、百度或任何车厂的图形标识与认证标（含 MFi badge）。
+- 仓库内**不含**反编译产物、厂商 SDK、抓包二进制、证书私钥或真实热点密码
+  （`.tools/`、`carlife-ref/`、`*.dex`、`*.jks` 均在 `.gitignore`）。
 - 真车验证前，建议先用可借到的 iPhone 与车机做一次正常无线配对，留作对照基线。
 
 ---
