@@ -38,6 +38,8 @@ object DisclaimerDialog {
      * @param requireAcceptance true=首次启动强制接受；false=菜单只读
      * @param deadlineAt 倒计时截止的 elapsedRealtime（仅强制形态使用）
      * @param onDecline 点「放弃使用」后的回调（仅强制形态）
+     * @param onAccept 点「接受」并完成接受登记后的回调（仅强制形态；
+     *                 Activity 用来把「启动后自动连接」接上——接受之前不能发起连接）
      * @param onDismiss 任何方式关闭后的回调（Activity 用来清引用）
      */
     fun show(
@@ -45,6 +47,7 @@ object DisclaimerDialog {
         requireAcceptance: Boolean,
         deadlineAt: Long = 0L,
         onDecline: (() -> Unit)? = null,
+        onAccept: (() -> Unit)? = null,
         onDismiss: (() -> Unit)? = null,
     ): AlertDialog {
         val view = LayoutInflater.from(activity).inflate(R.layout.dialog_disclaimer, null)
@@ -133,6 +136,7 @@ object DisclaimerDialog {
                 if (!btnAccept.isEnabled) return@setOnClickListener
                 DisclaimerPrefs.accept(activity)
                 dialog.dismiss()
+                onAccept?.invoke()
             }
             btnDecline.setOnClickListener {
                 dialog.dismiss()

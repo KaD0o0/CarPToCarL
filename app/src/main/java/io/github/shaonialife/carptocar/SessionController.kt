@@ -372,9 +372,9 @@ object SessionController {
     @Volatile
     var activeScalePercent: Int = 100
 
-    /** 本会话目标帧率（合成节奏上限；「显示」设置运行中切换可实时生效）。 */
+    /** 本会话目标帧率：2026-10-25 起固定 60（[DisplayPrefs.FPS]），不再有设置项。 */
     @Volatile
-    var activeTargetFps: Int = 30
+    var activeTargetFps: Int = DisplayPrefs.FPS
 
     @Volatile
     var audioSender: AudioSender? = null
@@ -2163,14 +2163,8 @@ object SessionController {
                                         ((setup.displayWidth * scale).toInt().coerceAtLeast(320) / 2) * 2
                                     val streamH =
                                         ((setup.displayHeight * scale).toInt().coerceAtLeast(180) / 2) * 2
-                                    val fps =
-                                        appContext
-                                            ?.let {
-                                                DisplayPrefs
-                                                    .fps(it)
-                                            } ?: 30
                                     activeScalePercent = scalePct
-                                    activeTargetFps = fps
+                                    activeTargetFps = DisplayPrefs.FPS
                                     // 车机触摸在通告视图坐标系（如 1160×540），流已按比例
                                     // 缩放（如 1450×674）——注入前需映射，否则点击漂移
                                     TouchRouter
@@ -2191,7 +2185,7 @@ object SessionController {
                                     )
                                     appendLog(
                                         "DISPLAY: 流 ${setup.displayWidth}x${setup.displayHeight} → " +
-                                            "${streamW}x$streamH（$scalePct%）@${fps}fps",
+                                            "${streamW}x$streamH（$scalePct%）@${DisplayPrefs.FPS}fps",
                                     )
                                     pendingVideoW = streamW
                                     pendingVideoH = streamH
@@ -2226,7 +2220,7 @@ object SessionController {
                                             frameCipher = screen.cipher,
                                             width = streamOutW,
                                             height = streamOutH,
-                                            targetFps = fps,
+                                            targetFps = DisplayPrefs.FPS,
                                             log = { line -> appendLog(line) },
                                             keepAliveWithStats = setup.keepAliveSendStatsAsBody,
                                             // 直通模式：VideoConfig 声明实时跟随 98311 上报值。

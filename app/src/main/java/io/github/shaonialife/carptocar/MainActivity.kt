@@ -32,11 +32,11 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.DrawableCompat
 import io.github.shaonialife.carptocar.bt.BtProfiles
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
-import io.github.shaonialife.carptocar.carlife.CarLifeDevConfig
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
 import io.github.shaonialife.carptocar.input.TouchRouter
 import io.github.shaonialife.carptocar.launcher.VirtualLauncher
 import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
+import io.github.shaonialife.carptocar.launcher.settings.AutoConnectPrefs
 import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.legal.DisclaimerDialog
 import io.github.shaonialife.carptocar.legal.DisclaimerPrefs
@@ -114,6 +114,12 @@ class MainActivity : AppCompatActivity() {
 
     private var activeDisclaimer: androidx.appcompat.app.AlertDialog? = null
 
+    /**
+     * 冷启动自动连接请求挂起中：等前置条件齐备（免责声明已接受、启动残留扫描已结束、
+     * 英雄卡空闲）才真正发起。旋转/重建不会置位——[maybeAutoConnect] 全程幂等。
+     */
+    private var autoConnectRequested = false
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val heroTick: Runnable =
         object : Runnable {
@@ -175,6 +181,35 @@ class MainActivity : AppCompatActivity() {
                     },
                 ),
         )
+    }
+
+    /**
+     * 启动后自动连接（默认开启，开关在「连接准备」卡里）。
+     *
+     * 满足全部前置条件才发起，任一不满足就**原地返回、保留请求**，由对应时机再调一次：
+     * - 免责声明未接受 → 等 [showDisclaimer] 的 onAccept 回调续上；
+     * - 启动残留扫描进行中 / 有残留待确认 → 等 [detectResidualDisplays] 收尾续上
+     *   （否则「是否清理残留屏」弹窗会和连接流程的热点确认弹窗抢焦点）；
+     * - 已在连接/已连接 → 不重复发起。
+     *
+     * 走的是和手动点「启动连接」完全相同的链路（权限 → 蓝牙开关 → WLAN → 会话），
+     * [SessionController.startConnection] 本身幂等，不会双开。
+     */
+    private fun maybeAutoConnect() {
+        if (!autoConnectRequested || isFinishing || isDestroyed) return
+        if (!AutoConnectPrefs.enabled(this)) {
+            autoConnectRequested = false
+            log("AUTOCONNECT: 已关闭——等待手动点「启动连接」")
+            return
+        }
+        if (!DisclaimerPrefs.hasAcceptedCurrent(this)) return
+        if (startupCheckRunning || pendingResidualDisplays != null) return
+        if (SessionController.isSessionRunning() || SessionController.sessionStarting.get()) return
+        if (heroState != HeroState.IDLE) return
+
+        autoConnectRequested = false
+        log("AUTOCONNECT: 打开 App 即自动发起连接（可在「连接准备」里关闭）")
+        proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
     }
 
     /**
@@ -477,13 +512,21 @@ class MainActivity : AppCompatActivity() {
 
         // 免责声明：未接受当前版本时强制弹（不可取消、需倒计时 + 滑到底）。
         // savedState 非空（旋转/重建）时复用原截止时刻，不重新计时。
-        if (savedInstanceState == null &&
-            needsDisclaimerAtLaunch(
-                DisclaimerPrefs.acceptedVersion(this),
-                DisclaimerPrefs.CURRENT_VERSION,
-            )
-        ) {
+        val needsDisclaimer =
+            savedInstanceState == null &&
+                needsDisclaimerAtLaunch(
+                    DisclaimerPrefs.acceptedVersion(this),
+                    DisclaimerPrefs.CURRENT_VERSION,
+                )
+        if (needsDisclaimer) {
             showDisclaimer(requireAcceptance = true)
+        }
+
+        // 启动后自动连接：只在**冷启动**发起（旋转/重建不重复）。
+        // 真正发起由 maybeAutoConnect 判定——前置条件不齐时它会等下一次时机。
+        if (savedInstanceState == null) {
+            autoConnectRequested = true
+            mainHandler.postDelayed({ maybeAutoConnect() }, 700L)
         }
     }
 
@@ -502,9 +545,12 @@ class MainActivity : AppCompatActivity() {
                     onDecline = {
                         // 放弃使用：结束本任务并退出（不用 System.exit，保留正常生命周期收尾）。
                         // 若已有会话在跑，先正常断开，避免留下无人管理的推流与虚拟屏。
+                        autoConnectRequested = false
                         runCatching { SessionController.disconnect(this) }
                         finishAndRemoveTask()
                     },
+                    // 接受后再续上冷启动自动连接（未接受前不能发起任何连接）
+                    onAccept = { mainHandler.postDelayed({ maybeAutoConnect() }, 400L) },
                     onDismiss = { activeDisclaimer = null },
                 )
     }
@@ -530,6 +576,24 @@ class MainActivity : AppCompatActivity() {
         }
 
         // ---- 连接准备 ----
+        // 启动后自动连接：默认开启。打开 App 即发起连接，不必每次点英雄卡；
+        // 需要在连之前改「下次连接起效」的项（分辨率缩放 / CarLife 劫持开关）时关掉它。
+        val autoConnectNote = findViewById<TextView>(R.id.autoConnectNote)
+        val switchAutoConnect = findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.switchAutoConnect)
+        switchAutoConnect.isChecked = AutoConnectPrefs.enabled(this)
+        autoConnectNote.text =
+            if (switchAutoConnect.isChecked) {
+                "打开 App 即自动发起连接（默认开启）"
+            } else {
+                "关闭后需手动点「启动连接」"
+            }
+        switchAutoConnect.setOnCheckedChangeListener { _, checked ->
+            AutoConnectPrefs.setEnabled(this, checked)
+            autoConnectNote.text =
+                if (checked) "打开 App 即自动发起连接（默认开启）" else "关闭后需手动点「启动连接」"
+            log("AUTOCONNECT: 启动后自动连接已${if (checked) "开启" else "关闭"}")
+        }
+
         // 本机蓝牙地址：Honor/MagicOS 等机型把 MAC 全面脱敏（连 adb shell 都读不到），
         // 而 WinPlay 系接收端按它做设备过滤——手填是唯一可行来源，存进 settings 偏好，
         // DeviceIdentity 会优先采用（影响 0x4300/0x4E0E、AirPlay SETUP 与 ctrl 广播 id）。
@@ -555,32 +619,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        findViewById<TextView>(R.id.btnQuality).setOnClickListener {
-            if (!CarLifeDevConfig.hasPermission()) {
-                log("CARLIFE: 画质增强需要「所有文件访问」权限——正在打开系统设置页")
-                runCatching {
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                            Uri.parse("package:$packageName"),
-                        ),
-                    )
-                }.onFailure {
-                    runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
-                }
-                snack("授予「所有文件访问」后回来再点一次")
-            } else {
-                val line = CarLifeDevConfig.provision()
-                log(line)
-                snack(if (line.contains("已写入")) "已启用——重启 CarLife+ 生效" else line)
-            }
-            refreshQualityHint()
-        }
-
-        // 画质配置**不自动写**：实测这条 MediaFormat 通道对码率/帧率无效，
-        // 而 /sdcard/BaiduCarlife/vehicle 一存在就会让 CarLife 进入调试模式，
-        // 白担开销。想要它的人自己点按钮开启。
-        refreshQualityHint()
+        // 「画质增强」（写 CarLife 官方调试配置）入口已按用户要求从首页移除：
+        // 实测这条 MediaFormat 通道对码率/帧率无效，而 /sdcard/BaiduCarlife/vehicle
+        // 一存在就会让 CarLife 进入调试模式，白担开销。CarLifeDevConfig 保留备用
+        // （需要时可在代码里直接调用 provision()），界面不再暴露。
 
         findViewById<TextView>(R.id.btnWifi).setOnClickListener {
             val ssid = ssidInput.text.toString().trim()
@@ -699,16 +741,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 刷新「画质增强」一行的副标题：有权限显示实际效果，无权限提示去授权。 */
-    private fun refreshQualityHint() {
-        val hint = findViewById<TextView>(R.id.tvQualityHint) ?: return
-        hint.text = if (CarLifeDevConfig.hasPermission()) {
-            "调试配置已写入 · 实测码率与帧率由 CarLife 引擎决定（1080p@20），此开关只调 I 帧间隔"
-        } else {
-            "未授权「所有文件访问」——点击右侧按钮开启"
-        }
-    }
-
     private fun bindExpandable(
         headerId: Int,
         body: View,
@@ -781,8 +813,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 英雄卡统计行（仅连接时显示）：运行时分辨率 + 实际/目标帧率。
+     * 英雄卡统计行（仅连接时显示）：运行时分辨率 + 实测帧率。
      * 实际帧率 = 1s 轮询对已发帧计数取差值；新会话计数归零时先对齐基线。
+     * 目标帧率不再展示（固定 60，见 [DisplayPrefs.FPS]），只报实测值。
      */
     private fun updateHeroStats() {
         if (heroState != HeroState.CONNECTED) return
@@ -792,7 +825,7 @@ class MainActivity : AppCompatActivity() {
         lastSentFrames = sent
         heroStats.text =
             "分辨率 ${SessionController.activeScalePercent}% · " +
-            "$fps/${SessionController.activeTargetFps} fps"
+            "$fps fps"
     }
 
     private fun applyHeroState(s: HeroState) {
@@ -967,30 +1000,9 @@ class MainActivity : AppCompatActivity() {
             },
         )
 
-        // 目标帧率（30/60，运行中实时切换）
-        val fps30 = findViewById<TextView>(R.id.btnFps30)
-        val fps60 = findViewById<TextView>(R.id.btnFps60)
-
-        fun refreshFps(active30: Boolean) {
-            fps30.setBackgroundResource(if (active30) R.drawable.bg_segment_sel else R.drawable.bg_segment)
-            fps30.setTextColor(if (active30) 0xFFFFFFFF.toInt() else 0xFF8E8E93.toInt())
-            fps60.setBackgroundResource(if (active30) R.drawable.bg_segment else R.drawable.bg_segment_sel)
-            fps60.setTextColor(if (active30) 0xFF8E8E93.toInt() else 0xFFFFFFFF.toInt())
-        }
-
-        val savedFps = DisplayPrefs.fps(ctx)
-        refreshFps(savedFps < 60)
-
-        fun applyFps(fps: Int) {
-            DisplayPrefs.setFps(ctx, fps)
-            refreshFps(fps < 60)
-            VirtualLauncher.setStreamFps(fps)
-            val live = SessionController.videoSender?.isRunning == true
-            snack("帧率已切换为 ${fps}fps${if (live) "（实时生效）" else ""}")
-            if (live) SessionController.activeTargetFps = fps
-        }
-        fps30.setOnClickListener { applyFps(30) }
-        fps60.setOnClickListener { applyFps(60) }
+        // 目标帧率（30/60 二选一）已于 2026-10-25 移除：固定 60fps，见 DisplayPrefs.FPS。
+        // 会话建立时 SessionController 按 DisplayPrefs.FPS 申请，运行中不再提供切换。
+        VirtualLauncher.setStreamFps(DisplayPrefs.FPS)
 
         // 触摸注入节流（0=关闭，步进 8ms）
         val throttleSeek = findViewById<SeekBar>(R.id.throttleSeek)
@@ -1937,6 +1949,10 @@ class MainActivity : AppCompatActivity() {
                     // 无残留：恢复「未连接」默认状态展示
                     applyHeroState(HeroState.IDLE)
                 }
+
+                // 启动自动连接在这里续最后一次：扫描期间英雄卡显示「检查中」，
+                // 且若有残留待确认，连接流程的热点/网络弹窗会和清理弹窗抢焦点，故推迟到这里。
+                maybeAutoConnect()
             }
 
             // 预绑定 UserService：预热触摸注入，并触发旧版本残留进程回收（绑定回调内含

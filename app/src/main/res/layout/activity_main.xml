@@ -209,13 +209,13 @@
                     android:indeterminateTint="@color/m3_primary"
                     android:visibility="gone" />
 
-                <!-- 连接统计：运行时分辨率 + 实际/目标帧率（1s 轮询差分，仅连接时显示） -->
+                <!-- 连接统计：运行时分辨率 + 实际帧率（1s 轮询差分，仅连接时显示） -->
                 <TextView
                     android:id="@+id/heroStats"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="10dp"
-                    android:text="分辨率 100% · 30/30 fps"
+                    android:text="分辨率 100% · 60 fps"
                     android:textColor="#8E8E93"
                     android:textSize="11.5sp"
                     android:visibility="gone" />
@@ -315,6 +315,70 @@
                         android:textColor="#6FC4CF"
                         android:textSize="11sp"
                         android:textStyle="bold" />
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginStart="54dp"
+                    android:background="#5A394444" />
+
+                <!-- 启动后自动连接（默认开启）：打开 App 即发起连接，无需手动点按钮 -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center_vertical"
+                    android:minHeight="60dp"
+                    android:orientation="horizontal"
+                    android:paddingTop="6dp"
+                    android:paddingBottom="6dp">
+
+                    <FrameLayout
+                        android:layout_width="38dp"
+                        android:layout_height="38dp"
+                        android:background="@drawable/bg_icon_tile">
+
+                        <ImageView
+                            android:layout_width="20dp"
+                            android:layout_height="20dp"
+                            android:layout_gravity="center"
+                            android:contentDescription="自动连接"
+                            android:src="@drawable/ic_play" />
+                    </FrameLayout>
+
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="14dp"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="启动后自动连接"
+                            android:textColor="@color/m3_on_surface"
+                            android:textSize="14.5sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:id="@+id/autoConnectNote"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:text="打开 App 即自动发起连接（默认开启）"
+                            android:textColor="@color/m3_on_var"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+
+                    <androidx.appcompat.widget.SwitchCompat
+                        xmlns:app="http://schemas.android.com/apk/res-auto"
+                        android:id="@+id/switchAutoConnect"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="8dp"
+                        android:thumb="@drawable/sw_thumb"
+                        app:track="@drawable/sw_track" />
                 </LinearLayout>
 
                 <View
@@ -497,65 +561,6 @@
                     android:layout_height="1dp"
                     android:layout_marginStart="54dp"
                     android:background="#5A394444" />
-
-                <!-- CarLife 画质增强（写官方调试配置） -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:gravity="center_vertical"
-                    android:orientation="horizontal"
-                    android:paddingStart="16dp"
-                    android:paddingTop="12dp"
-                    android:paddingEnd="16dp"
-                    android:paddingBottom="12dp">
-
-                    <LinearLayout
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="14dp"
-                        android:layout_weight="1"
-                        android:orientation="vertical">
-
-                        <TextView
-                            android:layout_width="wrap_content"
-                            android:layout_height="wrap_content"
-                            android:text="画质增强"
-                            android:textColor="@color/m3_on_surface"
-                            android:textSize="14.5sp"
-                            android:textStyle="bold" />
-
-                        <TextView
-                            android:id="@+id/tvQualityHint"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:layout_marginTop="2dp"
-                            android:text="每秒 I 帧 / 10 Mbps / Level 4（帧率仍由 CarLife 决定）"
-                            android:textColor="#7F8C99"
-                            android:textSize="11.5sp" />
-                    </LinearLayout>
-
-                    <TextView
-                        android:id="@+id/btnQuality"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="8dp"
-                        android:background="@drawable/bg_tbtn"
-                        android:gravity="center"
-                        android:paddingStart="12dp"
-                        android:paddingTop="9dp"
-                        android:paddingEnd="12dp"
-                        android:paddingBottom="9dp"
-                        android:text="启用"
-                        android:textColor="@color/m3_primary"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-                </LinearLayout>
-
-                <View
-                    android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:layout_marginStart="54dp"
-                    android:background="#5A394444" />
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -630,7 +635,8 @@
             </LinearLayout>
 
             <!-- 显示设置（原「显示」面板内容迁移至此，2026-10-24）：
-                 本地 CarLife 劫持开关 + 流分辨率缩放 + 目标帧率 + 触摸注入节流 -->
+                 本地 CarLife 劫持开关 + 流分辨率缩放 + 触摸注入节流
+                 （目标帧率设置已移除：固定 60fps，见 DisplayPrefs.FPS） -->
             <LinearLayout
                 android:id="@+id/displayCard"
                 android:layout_width="match_parent"
@@ -681,7 +687,7 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="2dp"
-                            android:text="分辨率缩放 · 目标帧率 · 触摸节流 · 劫持开关"
+                            android:text="分辨率缩放 · 触摸节流 · 劫持开关"
                             android:textColor="@color/m3_on_var"
                             android:textSize="12sp" />
                     </LinearLayout>
@@ -784,61 +790,6 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="2dp"
                     android:text="保存后下次连接起效"
-                    android:textColor="@color/m3_on_var"
-                    android:textSize="12sp" />
-
-                <!-- 目标帧率 -->
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="14dp"
-                    android:text="目标帧率"
-                    android:textColor="@color/m3_on_surface"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-
-                <LinearLayout
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:background="@drawable/bg_segment"
-                    android:orientation="horizontal"
-                    android:padding="3dp">
-
-                    <TextView
-                        android:id="@+id/btnFps30"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:background="@drawable/bg_segment_sel"
-                        android:paddingStart="18dp"
-                        android:paddingTop="6dp"
-                        android:paddingEnd="18dp"
-                        android:paddingBottom="6dp"
-                        android:text="30 fps"
-                        android:textColor="#FFFFFFFF"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:id="@+id/btnFps60"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:layout_marginStart="2dp"
-                        android:paddingStart="18dp"
-                        android:paddingTop="6dp"
-                        android:paddingEnd="18dp"
-                        android:paddingBottom="6dp"
-                        android:text="60 fps"
-                        android:textColor="#FF8E8E93"
-                        android:textSize="13sp"
-                        android:textStyle="bold" />
-                </LinearLayout>
-
-                <TextView
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
-                    android:text="连接中切换实时生效；英雄卡实时显示「实际/目标」帧率"
                     android:textColor="@color/m3_on_var"
                     android:textSize="12sp" />
 

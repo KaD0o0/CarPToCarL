@@ -509,9 +509,8 @@ object VirtualLauncher {
         log("LAUNCHER: 虚拟屏模式=${if (useTrusted) "受信屏(shell)" else "应用屏(回退)"}")
 
         val composer = DualDisplayComposer(encoderSurface, totalWidth, totalHeight, dockAtBottom)
-        composer.targetFps =
-            DisplayPrefs
-                .fps(context)
+        // 2026-10-25 起帧率固定 60（DisplayPrefs.FPS），不再有 30/60 设置项
+        composer.targetFps = DisplayPrefs.FPS
         this.composer = composer
         val displaysCreated = arrayOf(false)
         composer.onSurfacesReady = { dockSurface, appSurface, appHiSurface, mapSurface ->

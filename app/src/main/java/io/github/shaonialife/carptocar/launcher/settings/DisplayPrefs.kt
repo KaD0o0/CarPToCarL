@@ -8,10 +8,11 @@ import android.content.Context
  * - 分辨率缩放（30%–160%）：按车机通告分辨率的百分比生成流画布与虚拟屏，
  *   密度同步缩放（逻辑布局不变，只改像素量）。**仅下次连接生效**——
  *   编码器与全部虚拟屏按会话建立时的尺寸创建，运行中改无意义。
- * - 帧率（30/60）：合成器出帧节奏上限，运行中可实时切换。
+ * - 帧率：**固定 60fps**（2026-10-25 起不再提供 30/60 选择——车联侧把帧率
+ *   拉到 60 之后，App 侧再压回 30 只会让滑动发涩，没有保留价值）。
  *
  * 「实际生效值」由 SessionController 在会话建立时记录（activeScalePercent /
- * activeTargetFps），英雄卡显示运行时值而非偏好值。
+ * activeTargetFps）；英雄卡只显示运行时分辨率与实测帧率。
  */
 object DisplayPrefs {
     const val SCALE_MIN = 30
@@ -19,7 +20,8 @@ object DisplayPrefs {
     const val SCALE_STEP = 5
     const val SCALE_DEFAULT = 100
 
-    const val FPS_DEFAULT = 30
+    /** 目标帧率（固定值，无设置项）。 */
+    const val FPS = 60
 
     /** 触摸 move 注入节流默认值（ms）：0=默认关闭，交互滞后时在「显示」面板调高试验。 */
     const val MOVE_THROTTLE_DEFAULT = 0
@@ -27,7 +29,6 @@ object DisplayPrefs {
 
     private const val PREFS_NAME = "settings"
     private const val KEY_SCALE = "display_scale_percent"
-    private const val KEY_FPS = "display_fps"
     private const val KEY_MOVE_THROTTLE = "move_throttle_ms"
 
     /** 流分辨率缩放百分比（30–160，步进 5；默认 100）。 */
@@ -45,23 +46,6 @@ object DisplayPrefs {
             .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
             .putInt(KEY_SCALE, percent.coerceIn(SCALE_MIN, SCALE_MAX))
-            .apply()
-    }
-
-    /** 目标帧率（30/60；驱动合成器出帧节奏，运行中切换实时生效）。 */
-    fun fps(context: Context): Int =
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .getInt(KEY_FPS, FPS_DEFAULT)
-
-    fun setFps(
-        context: Context,
-        fps: Int,
-    ) {
-        context
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putInt(KEY_FPS, if (fps >= 60) 60 else 30)
             .apply()
     }
 
