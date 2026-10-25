@@ -1,0 +1,863 @@
+package io.github.shaonialife.carptocar.carlife
+
+import java.io.DataInputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * 本机 CarLife **车机端（HU）** 客户端。
+ *
+ * 手机上的 CarLife 引擎（`com.baidu.carlife.honor` 等）在「无线连接」态会监听 7 个
+ * TCP 端口。本类从 **127.0.0.1** 连上去扮演车机，完成握手后即可收到手机推送的
+ * H.264 码流——这就是「本地劫持原生 CarLife」的数据面。
+ *
+ * 握手顺序（2026-10-23 实机验证，缺一步都不出画面）：
+ * ```
+ * -> 98305 (协议 3.0)   <- 65538 match=1
+ * -> 98343 (统计信息)   <- 65563/65540/65574
+ * -> 98307 (HU_INFO)    <- 65574 模块状态 -> 回 98344 全部置 1
+ * -> 98386 (特征配置)   (主动推，不等手机)
+ * -> 98311 (视频初始化) <- 65544 手机确认编码参数
+ * -> 98313 (启动推流)   <- 8240 开始推 H.264
+ * 每 1s -> 131074 心跳
+ * ```
+ *
+ * 音频走 9240（媒体）/ 9241（TTS）两条**裸字节流**：每包 12B 包头
+ * `[len][timestamp][type]` + 负载，type=0x30001 是格式宣告（CarlifeMusicInit），
+ * 0x30006 是裸 PCM。音频不需要车机主动请求——手机开始播放媒体就会推。
+ */
+class CarLifeHuClient(
+    private val host: String = "127.0.0.1",
+    private val log: (String) -> Unit,
+    private val onVideoFrame: (data: ByteArray, keyFrame: Boolean) -> Unit,
+    private val onVideoParams: (width: Int, height: Int, fps: Int) -> Unit = { _, _, _ -> },
+    /** 手机宣告音频格式（采样率, 声道数）。 */
+    private val onAudioFormat: (sampleRate: Int, channels: Int) -> Unit = { _, _ -> },
+    /** 收到一包裸 PCM（16bit 交织，size 为有效字节数）。 */
+    private val onAudioPcm: (pcm: ByteArray, size: Int) -> Unit = { _, _ -> },
+    /** 收到手机推送的媒体信息（歌名/歌手/封面，0x10035）。 */
+    private val onMediaInfo: (info: CarLifeMediaInfo) -> Unit = {},
+    private val connectTimeoutMs: Int = 3_000,
+    /**
+     * 向 CarLife 引擎申请的编码帧率（98311 的 fps 字段 + 98316 帧率变更）。
+     *
+     * 0.2.9 方案 A：引擎的编码器按此值配（申请 30 就只给约 20~30 帧），想跟手就拉到 60。
+     * 引擎确认时会回它自己实际跑的值（见 MD_VIDEO_ENC_INIT）。
+     *
+     * 0.2.10 实验：字节码实证引擎 `Recorder.changeFrameRate` 上限是 60（非旧结论 30），
+     * 所以 [requestHigherFrameRate] 会**直接发 98316 带 fps=60**（不再跳过），
+     * 验证 `setOutputTime50(1000/fps)` 能否把输出节拍从 50ms 拉到 16ms。
+     */
+    private val requestedFps: Int = 20,
+    /**
+     * 98386 特征配置里的 CONNECT_TYPE。默认 5 = Wi-Fi 局域网。
+     *
+     * 引擎会按连接类型选编码档位（实测 5 恒定 20fps），改这个值可以试出更高档位。
+     */
+    private val connectType: Int = 5,
+    /**
+     * 帧率变更命令的探测 id 列表。
+     *
+     * 手机端 `VideoMsgHandler.handleMessage` 里确实有 `VIDEO_ENCODER_FRAME_RATE_CHANGE`
+     * 分支（解析 `CarlifeVideoFrameRate{1:fps}`，判定 `3 <= fps <= 30`，成功后回
+     * `sendChangeDone`），但**协议命令号没有硬编码在 dex 里**，只能实测反推。
+     * 这里做成可配置，靠偏好 `fps_probe_ids` 改候选，不必反复重编译。
+     */
+    private val probeIds: IntArray = CarLifeProtocol.FRAME_RATE_PROBE_IDS,
+    /**
+     * 向 CarLife 引擎申请的**初始**编码分辨率（98311 的 width/height 字段）。
+     *
+     * 这是车机（HU）告诉手机引擎「我的屏幕多大」的唯一通道。默认 1280×720 与引擎
+     * 实际输出档位对齐（引擎白名单外/非标准分辨率会 `reset2Default` 降回 720p，
+     * 逆向 `VideoResolution.getResolution` 实证）——此前写死 1920×1080 白申请，
+     * 引擎照样回 720p，还让部分车机按错误画布建解码器解不出画面（概率性黑屏根因）。
+     *
+     * 车机连上后（AirPlay SETUP 通告真实分辨率）由 [setRequestedResolution] 动态更新。
+     */
+    private val initialWidth: Int = 1280,
+    private val initialHeight: Int = 720,
+    /**
+     * 98311 的 `needAdapterScreen`（字段 9）：请引擎在「车机画面比例 ≠ 编码比例」时做
+     * 等比适配而不是拉伸。默认 true——车机屏几乎都不是 16:9（奥迪 MIB3 是 21:9）。
+     */
+    private val needAdapterScreen: Boolean = true,
+    /**
+     * 98311 的 `saveArea`（字段 4~7）：车机安全区 [宽, 高, x, y]，来自 AirPlay /info 的
+     * `viewAreas[].safeArea`。厂商适配层据此算最终编码分辨率。
+     */
+    private val saveArea: IntArray? = null,
+    /** 98311 的 `drawUIOutsideSafeArea`（字段 8）。 */
+    private val drawUIOutsideSafeArea: Boolean = false,
+) {
+
+    private val running = AtomicBoolean(false)
+    private val sockets = ConcurrentHashMap<Int, Socket>()
+    private var cmdOut: OutputStream? = null
+    private var touchOut: OutputStream? = null
+
+    /** 命令帧写锁：心跳线程、握手线程与视频看门狗会并发下发，必须串行写同一条 socket。 */
+    private val writeLock = Any()
+
+    @Volatile
+    private var versionMatched = false
+
+    /**
+     * 视频通道（9242）是否已失效。
+     *
+     * 实测（2026-10-24 12:38:48）CarLife 引擎冷启动时 7 个端口**全部 accept**，但
+     * 视频/媒体/TTS 三条会在 accept 后立刻被引擎 reset——TCP 连接是通的，socket
+     * 却已经死了，于是握手成功、`fps` 永远是 0。控制通道不会因它关闭，所以必须
+     * 由看门狗单独把视频通道重连起来（否则整轮空转）。
+     */
+    @Volatile
+    private var videoDead = false
+
+    /** 最近一次收到视频帧的时刻（elapsedRealtime）。 */
+    @Volatile
+    private var lastFrameAt = 0L
+
+    /** 已收到的视频帧总数（诊断用）。 */
+    @Volatile
+    var videoFrameCount: Long = 0
+        private set
+
+    /** 视频已连上但迟迟不出帧时，重新下发编码初始化的次数（防止无限重试）。 */
+    @Volatile
+    private var reinitCount = 0
+
+    @Volatile
+    private var videoWidth = initialWidth.coerceAtLeast(320)
+
+    @Volatile
+    private var videoHeight = initialHeight.coerceAtLeast(180)
+
+    @Volatile
+    private var videoFps = requestedFps.coerceIn(15, 60)
+
+    /** 已记录过的未知音频包类型（避免刷屏）。 */
+    private val audioUnknownTypes = HashSet<Int>()
+
+    /** 已记录过的未处理控制消息 id（避免刷屏）。 */
+    private val unknownLogged = HashSet<Int>()
+
+    val isRunning: Boolean get() = running.get()
+
+    /** 当前视频分辨率（触控坐标映射用）。 */
+    val videoSize: Pair<Int, Int> get() = videoWidth to videoHeight
+
+    /** 已收到的音频包计数（诊断用）。 */
+    @Volatile
+    var audioPacketCount: Long = 0
+        private set
+
+    /** 连接并开始握手。阻塞不超过 [connectTimeoutMs] × 端口数，需在后台线程调用。 */
+    fun start(): Boolean {
+        if (running.get()) return true
+        log("CARLIFE: 连接本机车机端口 $host …")
+        for (port in PORTS) {
+            val socket = Socket()
+            try {
+                socket.tcpNoDelay = true
+                socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+                sockets[port] = socket
+            } catch (error: Exception) {
+                log("CARLIFE: 端口 $port 连接失败 - ${error.message}")
+                runCatching { socket.close() }
+            }
+        }
+        val cmd = sockets[CarLifeProtocol.PORT_CMD]
+        if (cmd == null) {
+            log("CARLIFE: 控制端口未连通，CarLife 可能不在「无线连接」态")
+            closeAll()
+            return false
+        }
+        cmdOut = cmd.getOutputStream()
+        touchOut = sockets[CarLifeProtocol.PORT_TOUCH]?.getOutputStream()
+        running.set(true)
+        lastFrameAt = android.os.SystemClock.uptimeMillis()
+
+        startReader("carlife-cmd") { cmdReader(cmd.getInputStream()) }
+        sockets[CarLifeProtocol.PORT_VIDEO]?.let { video ->
+            startReader("carlife-video") { videoReader(video.getInputStream()) }
+        }
+        sockets[CarLifeProtocol.PORT_MEDIA]?.let { media ->
+            startReader("carlife-media") {
+                audioReader(media.getInputStream(), "媒体")
+            }
+        }
+        sockets[CarLifeProtocol.PORT_TTS]?.let { tts ->
+            startReader("carlife-tts") {
+                audioReader(tts.getInputStream(), "TTS")
+            }
+        }
+        startReader("carlife-heartbeat") { heartbeatLoop() }
+        // 视频通道看门狗：冷启动期被引擎 reset、或中途断链时自动重连并重发编码初始化。
+        startReader("carlife-video-dog") { videoSupervisor() }
+
+        return sendVersionNegotiation()
+    }
+
+    fun stop() {
+        running.set(false)
+        closeAll()
+    }
+
+    // ---- 触控回传（车机 → 手机）----
+
+    fun touchDown(x: Int, y: Int) = sendTouch(CarLifeProtocol.TOUCH_DOWN, x, y)
+
+    fun touchMove(x: Int, y: Int) = sendTouch(CarLifeProtocol.TOUCH_MOVE, x, y)
+
+    fun touchUp(x: Int, y: Int) = sendTouch(CarLifeProtocol.TOUCH_UP, x, y)
+
+    /**
+     * 触控走 9340，但用的是**控制帧格式**（8B 头）而不是视频那种 12B 流格式——
+     * 手机端把这条 socket 当 ConnectSocket 读，按 CarlifeCmdMessage 解。
+     */
+    private fun sendTouch(
+        serviceType: Int,
+        x: Int,
+        y: Int,
+    ) {
+        val out = touchOut ?: return
+        val px = x.coerceIn(0, videoWidth - 1)
+        val py = y.coerceIn(0, videoHeight - 1)
+        val frame =
+            CarLifeProtocol.packCommand(
+                serviceType,
+                CarLifeProtocol.touchPoint(px, py),
+            )
+        runCatching { out.write(frame); out.flush() }
+    }
+
+    // ---- 握手 ----
+
+    private fun sendVersionNegotiation(): Boolean {
+        val deadline = System.currentTimeMillis() + 15_000
+        while (running.get() && !versionMatched && System.currentTimeMillis() < deadline) {
+            send(CarLifeProtocol.HU_PROTOCOL_VERSION, CarLifeProtocol.protocolVersion())
+            var waited = 0
+            while (waited < 1500 && !versionMatched && running.get()) {
+                Thread.sleep(100)
+                waited += 100
+            }
+        }
+        if (!versionMatched) {
+            log("CARLIFE: 15s 内未收到版本匹配，放弃本次连接")
+            stop()
+            return false
+        }
+        log("CARLIFE: 版本匹配成功（协议 3.0）")
+        return true
+    }
+
+    private fun cmdReader(input: InputStream) {
+        val data = DataInputStream(input)
+        try {
+            while (running.get()) {
+                val header = ByteArray(8)
+                data.readFully(header)
+                val length = ((header[0].toInt() and 0xFF) shl 8) or (header[1].toInt() and 0xFF)
+                val serviceType = readU32(header, 4)
+                val payload = ByteArray(length)
+                if (length > 0) data.readFully(payload)
+                handleMessage(serviceType, payload)
+            }
+        } catch (error: Exception) {
+            if (running.get()) log("CARLIFE: 控制通道断开 - ${error.message}")
+        } finally {
+            stop()
+        }
+    }
+
+    private fun handleMessage(serviceType: Int, payload: ByteArray) {
+        when (serviceType) {
+            CarLifeProtocol.MD_VERSION_MATCH -> {
+                versionMatched = true
+                send(CarLifeProtocol.HU_STATISTICS, CarLifeProtocol.statisticsInfo())
+            }
+
+            CarLifeProtocol.MD_INFO -> {
+                log("CARLIFE: 收到手机设备信息（${payload.size}B）")
+                send(CarLifeProtocol.HU_INFO, CarLifeProtocol.deviceInfo("${videoWidth}x$videoHeight"))
+                // 关键：车机必须主动推进，不能等手机下发鉴权
+                Thread {
+                    Thread.sleep(1200)
+                    log(
+                        "CARLIFE: 主动推送 98386 特征配置（CONNECT_TYPE=$connectType，" +
+                            "I 帧间隔=${CarLifeProtocol.I_FRAME_INTERVAL_DEFAULT} 帧，" +
+                            "DISABLE_RESOLUTION_OPTION=1 分辨率直通，MEDIA_LYRIC_SUPPORT=1 歌词）",
+                    )
+                    send(CarLifeProtocol.HU_FEATURE_CONFIG, CarLifeProtocol.featureConfig(connectType))
+                    Thread.sleep(1200)
+                    log("CARLIFE: 主动推送 98311 视频编码初始化 ${videoWidth}x$videoHeight@$videoFps")
+                    send(
+                        CarLifeProtocol.HU_VIDEO_ENC_INIT,
+                        buildEncoderInfo(),
+                    )
+                }.apply { isDaemon = true }.start()
+            }
+
+            CarLifeProtocol.MD_MODULE_STATUS -> {
+                val modules = CarLifeProtocol.parseModuleStatus(payload)
+                if (modules.isEmpty()) return
+                if (modules.any { it.second == 0 }) {
+                    send(
+                        CarLifeProtocol.HU_MODULE_CONTROL,
+                        CarLifeProtocol.moduleControl(modules.map { it.first }),
+                    )
+                }
+            }
+
+            CarLifeProtocol.MD_VIDEO_ENC_INIT -> {
+                // CarlifeVideoEncoderInfo: field1 width, field2 height, field3 fps
+                val info = readEncoderInfo(payload)
+                if (info != null) {
+                    videoWidth = info.first.coerceAtLeast(1)
+                    videoHeight = info.second.coerceAtLeast(1)
+                    // fps 字段缺失/为 0 时保留我们申请的值，别被清零成 1fps。
+                    if (info.third > 0) videoFps = info.third
+                    onVideoParams(videoWidth, videoHeight, videoFps)
+                }
+                log(
+                    "CARLIFE: 手机确认编码参数 ${videoWidth}x$videoHeight@$videoFps" +
+                        "（申请 ${requestedFps}fps），启动推流",
+                )
+                send(CarLifeProtocol.VIDEO_ENC_START, ByteArray(0))
+                requestHigherFrameRate()
+            }
+
+            CarLifeProtocol.MD_VIDEO_FRAME_RATE_DONE -> {
+                log("CARLIFE: 引擎已接受帧率变更（回包 ${payload.size}B）")
+            }
+
+            CarLifeProtocol.MD_FEATURE_CONFIG_DONE -> {
+                log("CARLIFE: 引擎已接受特征配置（CONNECT_TYPE=$connectType）")
+            }
+
+            CarLifeProtocol.MD_MEDIA_INFO -> {
+                // 手机 CarLife 内置播放器开始播放时主动推送的媒体信息（歌名/歌手/封面）
+                val infos = CarLifeProtocol.parseMediaInfoList(payload)
+                if (infos.isEmpty()) {
+                    log("CARLIFE: 收到媒体信息（${payload.size}B）但解析为空")
+                    return
+                }
+                infos.forEach { info ->
+                    log(
+                        "CARLIFE: 媒体信息 song=${info.song} artist=${info.artist} " +
+                            "album=${info.album} dur=${info.duration}ms mode=${info.mode} " +
+                            "art=${info.albumArt?.size ?: 0}B",
+                    )
+                    onMediaInfo(info)
+                }
+            }
+
+            CarLifeProtocol.MD_MEDIA_PROGRESS -> {
+                // 媒体进度条（u32 progressBar，单位 ms），暂只记录
+                val progress = if (payload.size >= 4) {
+                    ((payload[0].toInt() and 0xFF) shl 24) or
+                        ((payload[1].toInt() and 0xFF) shl 16) or
+                        ((payload[2].toInt() and 0xFF) shl 8) or
+                        (payload[3].toInt() and 0xFF)
+                } else {
+                    0
+                }
+                log("CARLIFE: 媒体进度 ${progress}ms")
+            }
+
+            in CarLifeProtocol.MD_IGNORED_IDS -> {
+                // 0 字节状态广播，无需回应也不必记录
+            }
+
+            CarLifeProtocol.VIDEO_ENC_DONE -> {
+                send(
+                    CarLifeProtocol.HU_VIDEO_ENC_INIT,
+                    buildEncoderInfo(),
+                )
+            }
+
+            else -> {
+                if (unknownLogged.add(serviceType)) {
+                    log("CARLIFE: 未处理的消息 id=$serviceType (0x%x) ${payload.size}B".format(serviceType))
+                }
+            }
+        }
+    }
+
+    /**
+     * 用 `VIDEO_ENCODER_FRAME_RATE_CHANGE`（98316）把引擎编码帧率拉到目标值。
+     *
+     * 98311 里的 fps 字段引擎只回显不生效；真正生效的是这条。
+     *
+     * 2026-10-24 第四轮逆向**纠正**：旧结论「3..30 硬判定」是错的——字节码铁证
+     * `Recorder.changeFrameRate` 的 clamp 是 `3..60`，且 `mDestFrameInterval = 1000/fps`、
+     * `setOutputTime50(1000/fps)` 直接拿这个值做输出节拍。所以 fps=60 时
+     * `mDestFrameInterval = 16ms`，理论上能把输出节拍拉到 60fps。
+     *
+     * 本轮实验：直接发 98316 带 fps=60（不再像 0.2.9 方案 A 那样跳过），
+     * 观察 5s 窗口实测帧率是否真能冲过 20。
+     */
+    private fun requestHigherFrameRate() {
+        val target = requestedFps.coerceIn(3, CarLifeProtocol.FRAME_RATE_MAX)
+        if (target <= 20) return
+        Thread {
+            try {
+                Thread.sleep(800)
+                if (!running.get()) return@Thread
+                for (id in probeIds) {
+                    log("CARLIFE: → 帧率变更 id=$id fps=$target（上限 ${CarLifeProtocol.FRAME_RATE_MAX}）")
+                    send(id, CarLifeProtocol.videoFrameRate(target))
+                    Thread.sleep(1_200)
+                    if (!running.get()) return@Thread
+                }
+            } catch (_: InterruptedException) {
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    // ---- 视频接收 ----
+
+    private fun videoReader(input: InputStream) {
+        val data = DataInputStream(input)
+        // 实测帧率窗口：每 5 秒统计一次，回答「98311 声明 60 到底有没有让引擎真的吐 60 帧」。
+        var windowStart = android.os.SystemClock.uptimeMillis()
+        var windowFrames = 0L
+        try {
+            while (running.get()) {
+                val header = ByteArray(12)
+                data.readFully(header)
+                val length = readU32(header, 0)
+                if (length < 0 || length > MAX_VIDEO_FRAME) {
+                    log("CARLIFE: 视频帧长度异常（$length），放弃该通道")
+                    break
+                }
+                val payload = ByteArray(length)
+                if (length > 0) data.readFully(payload)
+                if (length <= 0) continue
+                videoFrameCount++
+                lastFrameAt = android.os.SystemClock.uptimeMillis()
+                reinitCount = 0
+                windowFrames++
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - windowStart >= 5_000) {
+                    val fps = windowFrames * 1000.0 / (now - windowStart)
+                    log(
+                        "CARLIFE: 实测帧率 %.1ffps（5s 内 %d 帧，声明 $requestedFps）"
+                            .format(fps, windowFrames),
+                    )
+                    windowStart = now
+                    windowFrames = 0
+                }
+                onVideoFrame(payload, isKeyFrame(payload))
+            }
+        } catch (error: Exception) {
+            if (running.get()) log("CARLIFE: 视频通道断开 - ${error.message}")
+        } finally {
+            // 无论 EOF 还是 reset，都交给看门狗重连：这条 socket 已经不可用了。
+            videoDead = true
+        }
+    }
+
+    // ---- 视频通道看门狗 ----
+
+    /**
+     * 视频通道看门狗。
+     *
+     * 两条互斥的处理路径：
+     *  - **socket 真的死了**（被引擎 reset / 关掉）→ 重连 9242 并重走 98386+98311；
+     *  - **socket 还活着只是不出帧** → **只重发 98311，绝不换连接**。
+     *
+     * 第二条是实测教训：早先「重发 2 次无效就换连接」，结果是 App 退后台再回来、
+     * 或引擎编码器暂时卡住时，控制握手被整条丢掉，画面从「卡一下」变成「黑屏 +
+     * 重新走一遍 15s 版本协商」。98311 的代价只有一次编码器重建，而 98386+98313
+     * 的握手是全局状态，能不碰就不碰。
+     */
+    private fun videoSupervisor() {
+        var reconnects = 0
+        while (running.get()) {
+            Thread.sleep(1_000)
+            if (!running.get()) return
+            val socket = sockets[CarLifeProtocol.PORT_VIDEO]
+            if (socket == null || socket.isClosed || videoDead) {
+                if (reopenVideo()) {
+                    reconnects++
+                    // 引擎冷启动期可能连续 reset：只在第 1 次和每 10 次打日志，避免刷屏。
+                    if (reconnects == 1 || reconnects % 10 == 0) {
+                        log("CARLIFE: 视频通道已重连（第 $reconnects 次）——重新下发编码初始化")
+                    }
+                    restartEncoding()
+                    // 连上又立刻被 reset 时放慢节奏，别把引擎打满。
+                    if (reconnects > 3) Thread.sleep(2_000)
+                }
+                continue
+            }
+            if (!versionMatched) continue
+            val idle = android.os.SystemClock.uptimeMillis() - lastFrameAt
+            // 重发次数越多间隔越长（10s → 20s → 30s … 封顶 60s）：引擎卡住时
+            // 高频重发只会自己也变成负担，而间隔内一旦来帧 reinitCount 会被清零。
+            val need = (NO_FRAME_REINIT_MS * (1 + reinitCount / 3)).coerceAtMost(MAX_REINIT_INTERVAL_MS)
+            if (idle < need) continue
+            reinitCount = (reinitCount + 1).coerceAtMost(1_000)
+            log(
+                "CARLIFE: ${idle / 1000}s 无视频帧——第 $reinitCount 次重发 98311" +
+                    "（socket 存活，保持连接不重建）",
+            )
+            lastFrameAt = android.os.SystemClock.uptimeMillis()
+            resendEncInit()
+        }
+    }
+
+    /** 重连 9242。成功返回 true（已挂上新的读线程）。 */
+    private fun reopenVideo(): Boolean {
+        runCatching { sockets.remove(CarLifeProtocol.PORT_VIDEO)?.close() }
+        val socket = Socket()
+        return try {
+            socket.tcpNoDelay = true
+            socket.connect(
+                InetSocketAddress(host, CarLifeProtocol.PORT_VIDEO),
+                connectTimeoutMs,
+            )
+            if (!running.get()) {
+                runCatching { socket.close() }
+                return false
+            }
+            sockets[CarLifeProtocol.PORT_VIDEO] = socket
+            videoDead = false
+            lastFrameAt = android.os.SystemClock.uptimeMillis()
+            reinitCount = 0
+            startReader("carlife-video") { videoReader(socket.getInputStream()) }
+            true
+        } catch (error: Exception) {
+            runCatching { socket.close() }
+            false
+        }
+    }
+
+    /**
+     * 请求引擎重建编码器（重发 98386 + 98311）。
+     *
+     * 重建后引擎必然补一个「SPS + PPS + IDR」，车机侧就能拿到 VideoConfig 配置解码器。
+     * 用于「会话接上但一帧都送不出去」的死锁场景。
+     */
+    fun requestVideoReinit() {
+        if (!running.get()) return
+        log("CARLIFE: 请求引擎重建编码器（补 SPS/PPS 关键帧）")
+        restartEncoding()
+    }
+
+    /**
+     * 车机连上后更新申请分辨率，并重新下发 98311 让引擎按新车机画布编码。
+     *
+     * 时机：AirPlay SETUP 拿到车机真实分辨率（如奥迪 MIB3 的 1412×654）后调用。
+     * 引擎内部有白名单/默认档位决策，非标准分辨率可能仍降回 1280×720——这是引擎
+     * 侧限制，不是本侧能强制的；但申请车机真实值至少能让引擎「尝试」按车机匹配，
+     * 且不再拿写死的 1920×1080 误导后续直通流声明（见 SessionController 直通分支）。
+     *
+     * 幂等：宽高未变时跳过（避免车机 1s 轮询重复触发重发 98311 打断推流）。
+     */
+    fun setRequestedResolution(width: Int, height: Int) {
+        val w = width.coerceAtLeast(320)
+        val h = height.coerceAtLeast(180)
+        if (w == videoWidth && h == videoHeight) return
+        log("CARLIFE: 车机分辨率更新 ${videoWidth}x$videoHeight → ${w}x$h，重发 98311")
+        videoWidth = w
+        videoHeight = h
+        if (running.get()) resendEncInit()
+    }
+
+    /**
+     * 只重发 98311 编码初始化（**不碰** 98386）。
+     *
+     * 引擎收到 98311 会重建编码器并回 65544，我们的 65544 处理里会顺带补 98313
+     * 启动推流，所以单发这一条就能把码流重新推起来，且不会动到连接特征。
+     * 用于「socket 活着但不出帧」——这条路径绝不能升级成换连接。
+     */
+    private fun resendEncInit() {
+        Thread {
+            try {
+                Thread.sleep(300)
+                if (!running.get()) return@Thread
+                send(
+                    CarLifeProtocol.HU_VIDEO_ENC_INIT,
+                    buildEncoderInfo(),
+                )
+            } catch (_: InterruptedException) {
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** 重发 98386 特征配置 + 98311 编码初始化，让引擎重建编码器（异步，避免阻塞看门狗）。 */
+    private fun restartEncoding() {
+        Thread {
+            try {
+                Thread.sleep(300)
+                if (!running.get()) return@Thread
+                send(CarLifeProtocol.HU_FEATURE_CONFIG, CarLifeProtocol.featureConfig(connectType))
+                Thread.sleep(600)
+                if (!running.get()) return@Thread
+                send(
+                    CarLifeProtocol.HU_VIDEO_ENC_INIT,
+                    buildEncoderInfo(),
+                )
+            } catch (_: InterruptedException) {
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /**
+     * 构造 98311 载荷（统一的 9 字段版本）。
+     *
+     * 集中在一处，保证首次申请、重建、看门狗重发三条路径的字段完全一致——
+     * 之前四处各自拼 `videoEncoderInfo(w,h,fps)`，新增字段时极易漏改其中一两条。
+     */
+    private fun buildEncoderInfo(): ByteArray =
+        CarLifeProtocol.videoEncoderInfo(
+            videoWidth,
+            videoHeight,
+            videoFps,
+            needAdapterScreen = needAdapterScreen,
+            saveArea = saveArea,
+            drawUIOutsideSafeArea = drawUIOutsideSafeArea,
+        )
+
+    /** AnnexB 首个 NAL：7=SPS / 5=IDR 视为关键帧。 */
+    private fun isKeyFrame(data: ByteArray): Boolean {
+        var index = 0
+        while (index + 4 < data.size) {
+            if (data[index] == 0.toByte() && data[index + 1] == 0.toByte() &&
+                data[index + 2] == 0.toByte() && data[index + 3] == 1.toByte()
+            ) {
+                val type = data[index + 4].toInt() and 0x1F
+                return type == 5 || type == 7
+            }
+            index++
+        }
+        // 没有起始码时按裸 NAL 处理
+        val type = data[0].toInt() and 0x1F
+        return type == 5 || type == 7
+    }
+
+    // ---- 音频接收 ----
+
+    /**
+     * 音频通道（裸字节流，**不是** 12B 的 [len][seq][type] 结构）：
+     * 每包 `[u32 len][u32 timestamp][u32 type]` + `len` 字节负载。
+     */
+    private fun audioReader(
+        input: InputStream,
+        label: String,
+    ) {
+        val data = DataInputStream(input)
+        var announced = false
+        try {
+            while (running.get()) {
+                val head = ByteArray(CarLifeProtocol.AUDIO_HEAD_LEN)
+                data.readFully(head)
+                val length = readU32(head, 0)
+                val type = readU32(head, 8)
+                if (length < 0 || length > MAX_AUDIO_PACKET) {
+                    log("CARLIFE: $label 音频包长度异常（$length），放弃该通道")
+                    return
+                }
+                val payload = ByteArray(length)
+                if (length > 0) data.readFully(payload)
+                when (type) {
+                    CarLifeProtocol.MUSIC_PKG_INIT -> {
+                        val format = parseAudioInit(payload)
+                        if (format != null) {
+                            val (rate, channelConfig, sampleFormat) = format
+                            val channels = channelsOf(channelConfig)
+                            log(
+                                "CARLIFE: $label 音频格式宣告 ${rate}Hz " +
+                                    "${channels}ch ${sampleFormat}bit（channelConfig=$channelConfig）",
+                            )
+                            onAudioFormat(rate, channels)
+                            announced = true
+                        }
+                    }
+
+                    CarLifeProtocol.MUSIC_PKG_NORMAL -> {
+                        audioPacketCount++
+                        if (!announced) {
+                            // 手机没宣告格式就直接推 PCM：按 48k 立体声先顶着
+                            announced = true
+                            log("CARLIFE: $label 未收到格式宣告，按 48kHz 立体声处理")
+                            onAudioFormat(DEFAULT_AUDIO_RATE, 2)
+                        }
+                        if (length > 0) onAudioPcm(payload, length)
+                    }
+
+                    else -> {
+                        if (audioUnknownTypes.add(type)) {
+                            log("CARLIFE: ${carLifeAudioTypeName(type)} 音频包（长度 $length，暂不处理）")
+                        }
+                    }
+                }
+            }
+        } catch (error: Exception) {
+            if (running.get()) log("CARLIFE: $label 音频通道断开 - ${error.message}")
+        }
+    }
+
+    /** 解析 CarlifeMusicInit：field1 sampleRate / field2 channelConfig / field3 sampleFormat。 */
+    private fun parseAudioInit(payload: ByteArray): Triple<Int, Int, Int>? {
+        var sampleRate = 0
+        var channelConfig = 0
+        var sampleFormat = 0
+        var index = 0
+        while (index < payload.size) {
+            val tag = payload[index].toInt() and 0xFF
+            index++
+            if (tag and 0x07 != 0) return null
+            var value = 0
+            var shift = 0
+            while (index < payload.size) {
+                val byte = payload[index].toInt() and 0xFF
+                index++
+                value = value or ((byte and 0x7F) shl shift)
+                shift += 7
+                if (byte and 0x80 == 0) break
+            }
+            when (tag ushr 3) {
+                1 -> sampleRate = value
+                2 -> channelConfig = value
+                3 -> sampleFormat = value
+            }
+        }
+        // 字段号若与预期不符（不同版本 proto），按数值特征兜底识别：
+        // 采样率必然 > 4000，位深只会是 8/16，剩下的就是声道配置。
+        if (sampleRate <= 4000) {
+            val candidates = listOf(sampleRate, channelConfig, sampleFormat)
+            sampleRate = candidates.firstOrNull { it > 4000 } ?: DEFAULT_AUDIO_RATE
+        }
+        if (sampleFormat != 8 && sampleFormat != 16) {
+            val candidates = listOf(sampleRate, channelConfig, sampleFormat)
+            sampleFormat = candidates.firstOrNull { it == 8 || it == 16 } ?: 16
+        }
+        if (channelConfig <= 0 || channelConfig == sampleRate || channelConfig == sampleFormat) {
+            channelConfig = 2
+        }
+        return Triple(sampleRate, channelConfig, sampleFormat)
+    }
+
+    /** CarLife 的 channelConfig → 声道数（1=单声道，2/3/4/12 均按立体声处理）。 */
+    private fun channelsOf(channelConfig: Int): Int = if (channelConfig == 1) 1 else 2
+
+    // ---- 心跳 ----
+
+    private fun heartbeatLoop() {
+        try {
+            while (running.get()) {
+                Thread.sleep(1000)
+                if (!running.get()) return
+                send(CarLifeProtocol.HEARTBEAT, ByteArray(0))
+            }
+        } catch (error: Exception) {
+            if (running.get()) log("CARLIFE: 心跳中止 - ${error.message}")
+        }
+    }
+
+    // ---- 底层写入 ----
+
+    private fun send(serviceType: Int, payload: ByteArray): Boolean {
+        val out = cmdOut ?: return false
+        return try {
+            synchronized(writeLock) {
+                out.write(CarLifeProtocol.packCommand(serviceType, payload))
+                out.flush()
+            }
+            true
+        } catch (error: Exception) {
+            log("CARLIFE: 发送 0x%X 失败 - %s".format(serviceType, error.message))
+            false
+        }
+    }
+
+    private fun readEncoderInfo(payload: ByteArray): Triple<Int, Int, Int>? {
+        var width = 0
+        var height = 0
+        var fps = 0
+        var index = 0
+        while (index < payload.size) {
+            val tag = payload[index].toInt() and 0xFF
+            index++
+            if (tag and 0x07 != 0) return null
+            var value = 0
+            var shift = 0
+            while (index < payload.size) {
+                val byte = payload[index].toInt() and 0xFF
+                index++
+                value = value or ((byte and 0x7F) shl shift)
+                shift += 7
+                if (byte and 0x80 == 0) break
+            }
+            when (tag ushr 3) {
+                1 -> width = value
+                2 -> height = value
+                3 -> fps = value
+            }
+        }
+        if (width <= 0 || height <= 0) return null
+        return Triple(width, height, if (fps > 0) fps else 30)
+    }
+
+    private fun closeAll() {
+        for ((_, socket) in sockets) runCatching { socket.close() }
+        sockets.clear()
+        cmdOut = null
+        touchOut = null
+    }
+
+    private fun startReader(name: String, body: () -> Unit) {
+        Thread({
+            try {
+                body()
+            } catch (error: Exception) {
+                log("CARLIFE: $name 异常 - ${error.message}")
+            }
+        }, name).apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun readU32(data: ByteArray, offset: Int): Int =
+        ((data[offset].toInt() and 0xFF) shl 24) or
+            ((data[offset + 1].toInt() and 0xFF) shl 16) or
+            ((data[offset + 2].toInt() and 0xFF) shl 8) or
+            (data[offset + 3].toInt() and 0xFF)
+
+    companion object {
+        /** 音频包上限：192kHz 立体声 16bit 一包 100ms ≈ 76KB，留足余量。 */
+        private const val MAX_AUDIO_PACKET = 256 * 1024
+
+        /** 单个视频帧上限（1080p 高码率 I 帧实测 < 400KB，留足余量）。 */
+        private const val MAX_VIDEO_FRAME = 4 * 1024 * 1024
+
+        private const val DEFAULT_AUDIO_RATE = 48_000
+
+        /** 视频通道连上但多久不出帧就重发编码初始化。 */
+        private const val NO_FRAME_REINIT_MS = 10_000L
+
+        /**
+         * 连续重发时的最大间隔（毫秒）。
+         *
+         * socket 存活时只重发 98311、次数不设上限——只有 socket 真的死了才走重连。
+         */
+        private const val MAX_REINIT_INTERVAL_MS = 60_000L
+
+        private val PORTS = intArrayOf(
+            CarLifeProtocol.PORT_CMD,
+            CarLifeProtocol.PORT_VIDEO,
+            CarLifeProtocol.PORT_MEDIA,
+            CarLifeProtocol.PORT_TTS,
+            CarLifeProtocol.PORT_VR,
+            CarLifeProtocol.PORT_TOUCH,
+            CarLifeProtocol.PORT_DATA,
+        )
+    }
+}

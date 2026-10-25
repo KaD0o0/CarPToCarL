@@ -1,0 +1,504 @@
+package io.github.shaonialife.carptocar.carlife
+
+/**
+ * CarLife 车机端（HU）协议常量与小工具。
+ *
+ * 协议细节来自 2026-10-23 实机验证（见 docs/carlife-hijack-findings.md）：
+ * 手机端（MD）监听 7 个 TCP 端口，车机端主动连接；控制通道 8 字节头，
+ * 其余通道 12 字节头；protobuf 手写编码，不引入 protobuf 运行时。
+ */
+internal object CarLifeProtocol {
+
+    // ---- 端口 ----
+    const val PORT_CMD = 7240
+    const val PORT_VIDEO = 8240
+    const val PORT_MEDIA = 9240
+    const val PORT_TTS = 9241
+    const val PORT_VR = 9242
+    const val PORT_TOUCH = 9340
+    const val PORT_DATA = 9440
+
+    // ---- 消息 ID ----
+    const val HU_PROTOCOL_VERSION = 98305
+    const val MD_VERSION_MATCH = 65538
+    const val HU_STATISTICS = 98343
+    const val MD_INFO = 65540
+    const val HU_INFO = 98307
+    const val HU_AUTHEN_ACK = 98380
+    const val HU_VIDEO_ENC_INIT = 98311
+    const val VIDEO_ENC_START = 98313
+
+    /**
+     * 帧率变更请求 / 确认（`VIDEO_ENCODER_FRAME_RATE_CHANGE`）。
+     *
+     * 命令号来自手机包 `com.baidu.carlife.core.CommonParams` 的常量表：
+     *  - MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE      = 98316
+     *  - MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE = 65549
+     *  - MSG_CMD_VIDEO_ENCODER_PAUSE = 98314 / RESET = 98315 / START = 98313
+     *
+     * 载荷是 `CarlifeVideoFrameRateProto.CarlifeVideoFrameRate`（field1 = frameRate）。
+     * 98311 里自带的 fps 字段引擎**只回显不生效**，真正的帧率通道是这条。
+     */
+    const val HU_VIDEO_FRAME_RATE = 98316
+    const val MD_VIDEO_FRAME_RATE_DONE = 65549
+
+    /** 视频编码器暂停 / 复位（保留常量，便于排查，不要用来改帧率）。 */
+    const val HU_VIDEO_ENC_PAUSE = 98314
+    const val HU_VIDEO_ENC_RESET = 98315
+
+    /**
+     * 帧率变更命令候选 id。
+     *
+     * 字节码铁证（2026-10-24 第四轮逆向）：`Recorder.changeFrameRate` 的范围判定是
+     * `clamp(frame, 3, 60)`（const/16 #3 / const/16 #60），**不是旧结论的 3~30**。
+     * 所以这里把上限修正为 60——98316 直接发 60 是合法且会被引擎采纳的。
+     */
+    val FRAME_RATE_PROBE_IDS = intArrayOf(HU_VIDEO_FRAME_RATE)
+
+    /** 手机端引擎的硬上限（字节码实证 `Recorder.changeFrameRate` 判 3..60）。 */
+    const val FRAME_RATE_MAX = 60
+    const val MD_VIDEO_ENC_INIT = 65544
+    const val VIDEO_ENC_DONE = 65551
+    const val HU_FEATURE_CONFIG = 98386
+    const val MD_FEATURE_CONFIG = 65617
+    const val MD_MODULE_STATUS = 65574
+    const val HU_MODULE_CONTROL = 98344
+
+    /**
+     * 98386 的确认（0 字节，引擎收到特征配置后回）。
+     *
+     * 实测时序：发 98386 → 约 0.7s 后收到 65570 → 再发 98311。所以它可以当
+     * 「特征配置已被接受」的凭据，比盲发有用。
+     */
+    const val MD_FEATURE_CONFIG_DONE = 65570
+
+    /**
+     * 手机端主动推送的媒体信息（歌名/歌手/专辑/封面/时长）。
+     *
+     * 命令号来自 `com.baidu.carlife.core.CommonParams.MSG_CMD_MEDIA_INFO = 0x00010035`，
+     * 载荷是 `CarlifeMediaInfoListProto.CarlifeMediaInfoList`（见车机端参考实现
+     * CTranRecvPackageProcess.cpp 的 0x10035 分支）。方向 MD→HU：手机 CarLife 内置
+     * 播放器开始播放音乐时，由 `sendMusicInfoToVehicle` 主动推给车机。
+     */
+    const val MD_MEDIA_INFO = 65589
+
+    /** 手机端媒体进度条（`MSG_CMD_MEDIA_PROGRESS_BAR = 0x00010036`，载荷 u32 progressBar）。 */
+    const val MD_MEDIA_PROGRESS = 65590
+
+    /**
+     * 手机自发的状态广播，都是 0 字节、无需回应。
+     *
+     * 65563(0x1001B)/65560(0x10018) 在版本匹配前后就会到，属于引擎的常规状态上报。
+     * 留着不打日志，避免每次握手都刷三行「未处理」，把真正有用的行挤掉。
+     */
+    val MD_IGNORED_IDS = intArrayOf(65560, 65563)
+
+    // ---- 触控（9340 / Touch 通道，**控制帧格式** 8B 头）----
+    //
+    // 反编译 MD 端 CarlifeTouchManager.dispatchTouchEvent 实证：它是
+    // `packed-switch` 到 0x68001 起的连续 ID，**动作由消息 ID 决定**，
+    // 负载是 CarlifeTouchSinglePoint{x, y, pointerx, pointery}（没有 action 字段）。
+    // 0x68004 才是硬按键（负载 CarlifeCarHardKeyCode），0x6800D 是复合动作
+    // （CarlifeTouchAction{action,x,y,pointerx,pointery}）。
+    const val TOUCH_DOWN = 425985 // 0x68001
+    const val TOUCH_MOVE = 425986 // 0x68002
+    const val TOUCH_UP = 425987 // 0x68003
+
+    const val HEARTBEAT = 131074
+
+    /** CONNECT_TYPE：5 = Wi-Fi 局域网 */
+    const val CONNECT_TYPE_WIFI = 5
+
+    // ---- 音频（9240 媒体 / 9241 TTS）----
+    //
+    // 音频通道是**裸字节流**，不走控制通道的 8B 头，也不走视频的 [len][seq][type]：
+    // 每包 = 12B 包头 + 负载（手机端 PCMPackageHead 逐字节写死）：
+    //   [0..3] 负载长度 BE | [4..7] 时间戳 ms BE | [8..11] 包类型 BE
+    // 包类型来自 AudioUtil.EMusicPackageType：INIT=0x30001（负载是 CarlifeMusicInit
+    // 原型，宣告采样率/声道/位深），NORMAL=0x30006（负载是裸 PCM）。
+    const val AUDIO_HEAD_LEN = 12
+    const val MUSIC_PKG_INIT = 0x30001
+    const val MUSIC_PKG_NORMAL = 0x30006
+
+    // ---- 帧格式 ----
+
+    /** 控制通道（Channel 1）：[u16 len][u16 reserved][u32 service_type] */
+    fun packCommand(serviceType: Int, payload: ByteArray): ByteArray {
+        val out = ByteArray(8 + payload.size)
+        writeU16(out, 0, payload.size)
+        writeU16(out, 2, 0)
+        writeU32(out, 4, serviceType)
+        System.arraycopy(payload, 0, out, 8, payload.size)
+        return out
+    }
+
+    /** 数据通道（非 Channel 1）：[u32 len][u32 seq][u32 service_type] */
+    fun packStream(seq: Int, serviceType: Int, payload: ByteArray): ByteArray {
+        val out = ByteArray(12 + payload.size)
+        writeU32(out, 0, payload.size)
+        writeU32(out, 4, seq)
+        writeU32(out, 8, serviceType)
+        System.arraycopy(payload, 0, out, 12, payload.size)
+        return out
+    }
+
+    // ---- protobuf 手写编码 ----
+
+    fun pbVarint(field: Int, value: Int): ByteArray {
+        val head = byteArrayOf(((field shl 3) or 0).toByte())
+        return head + varintBytes(value.toLong())
+    }
+
+    fun pbString(field: Int, value: String): ByteArray = pbBytes(field, value.toByteArray(Charsets.UTF_8))
+
+    fun pbBytes(field: Int, value: ByteArray): ByteArray {
+        val head = byteArrayOf(((field shl 3) or 2).toByte())
+        return head + varintBytes(value.size.toLong()) + value
+    }
+
+    private fun varintBytes(input: Long): ByteArray {
+        var value = input
+        val out = ArrayList<Byte>(8)
+        while (true) {
+            val low = (value and 0x7F).toInt()
+            value = value ushr 7
+            if (value == 0L) {
+                out.add(low.toByte())
+                return out.toByteArray()
+            }
+            out.add((low or 0x80).toByte())
+        }
+    }
+
+    // ---- 载荷构造 ----
+
+    /**
+     * 协议版本 **3.0**，不是 4.0。
+     *
+     * MD 端 `updateVehicleVersion()`：`major==4` 或 `(3,2)` 会置「新车机版本」，
+     * 从而走 RSA/AES 加密鉴权且永不下发 65611，会话静默挂死；而手机支持列表是
+     * {1.0, 2.0, 3.0, 4.0}，发 3.0 既 match=1 又走老版明文路径。
+     */
+    fun protocolVersion(): ByteArray = pbVarint(1, 3) + pbVarint(2, 0)
+
+    fun statisticsInfo(): ByteArray =
+        pbString(1, "12345678") + // cuid
+            pbString(2, "4.0.0") + // versionName
+            pbVarint(3, 16) + // versionCode
+            pbString(4, "20029999") // channel
+
+    /**
+     * 车机设备信息。字段号必须与官方车机版 `CarlifeDeviceInfoProto` 一致：
+     * 1 os, 2 board, 3 bootloader, 4 brand, 5 cpuAbi, 6 cpuAbi2, 7 device, 8 display…
+     * 早期按猜测把字符串写进 sdkInt 等整型位，对端 protobuf 解析抛异常后静默断链。
+     */
+    fun deviceInfo(
+        display: String = "1280x720",
+    ): ByteArray =
+        pbString(1, "Android") +
+            pbString(2, "msm8998") +
+            pbString(3, "unknown") +
+            pbString(4, "baidu") +
+            pbString(5, "arm64-v8a") +
+            pbString(6, "arm64-v8a") +
+            pbString(7, "CarLifeVehicle") +
+            pbString(8, display)
+
+    /**
+     * 每多少个 P 帧插一个 I 帧。
+     *
+     * 原值 300 = 20fps 下 **15 秒才一个 I 帧**：车机端一旦丢包/花屏要熬 15 秒才自愈，
+     * 且 I 帧稀少意味着长时间没有完整画面重建。改成 20（=1 秒）后：
+     *  - 车机端花屏 1 秒内自愈；
+     *  - 每秒都有完整帧，平均码率随之上升（I 帧远大于 P 帧），1080p 下的块效应明显减轻。
+     */
+    const val I_FRAME_INTERVAL_DEFAULT = 20
+
+    /**
+     * 特征配置：CONNECT_TYPE + I 帧间隔 + 分辨率直通 + 歌词支持。
+     *
+     * 2026-10-25 逆向 `FeatureConfigManager.excute()`（手机引擎）实证两条关键开关：
+     *  - `DISABLE_RESOLUTION_OPTION = 1` → `Recorder.useVehicleResolution = true`：
+     *    引擎不再按宽度把 98311 上报的车机分辨率分档（1412 会被压成 1280×720），
+     *    而是直接用 `mVehiclWidth × mVehiclHigh`（即 98311 的真实宽高）编码，
+     *    **21:9 车机不再被横向拉伸**。
+     *  - `MEDIA_LYRIC_SUPPORT = 1` → 引擎 dispatch `carlife_other_media_lyric_support`，
+     *    开启歌词支持。
+     */
+    fun featureConfig(
+        connectType: Int = CONNECT_TYPE_WIFI,
+        iFrameInterval: Int = I_FRAME_INTERVAL_DEFAULT,
+        useVehicleResolution: Boolean = true,
+        mediaLyricSupport: Boolean = true,
+    ): ByteArray {
+        val items = ArrayList<ByteArray>()
+        items += pbString(1, "I_FRAME_INTERVAL") + pbVarint(2, iFrameInterval)
+        items += pbString(1, "CONNECT_TYPE") + pbVarint(2, connectType)
+        items += pbString(1, "DISABLE_RESOLUTION_OPTION") + pbVarint(2, if (useVehicleResolution) 1 else 0)
+        items += pbString(1, "MEDIA_LYRIC_SUPPORT") + pbVarint(2, if (mediaLyricSupport) 1 else 0)
+        var list = ByteArray(0)
+        for (item in items) list += pbBytes(2, item)
+        val cnt = items.size
+        return pbVarint(1, cnt) + list + pbVarint(3, 0) + pbString(4, "CarDeck") + pbString(5, "00:11:22:33:44:55")
+    }
+
+    /**
+     * 车机 → 手机的编码参数申请（98311）。
+     *
+     * 8.8.5 的 `CarlifeVideoEncoderInfo` 比旧版 proto 多 6 个字段（逆向 `writeTo` 实证）：
+     * ```
+     * 1 width  int32 | 2 height int32 | 3 frameRate int32
+     * 4 saveAreaWidth int32 | 5 saveAreaHeight int32 | 6 saveAreaX int32 | 7 saveAreaY int32
+     * 8 drawUIOutsideSafeArea bool | 9 needAdapterScreen bool
+     * ```
+     * 这些不是装饰：`MediaFormatUtils.setVendorEncoderParams` 会把它们打包进
+     * `dispatcherAction("carlife_encode_format", map)` 交给**厂商适配层（荣耀 mix 模块）**，
+     * 由厂商层决定最终 `MediaFormat` 的 width/height（返回非 null 时覆盖引擎自己算的值）。
+     * 所以只发 width/height 时，厂商层拿不到「车机真实画布 / 安全区 / 是否需适配」，
+     * 会按自己的规则回 1280×720 → 21:9 车机被横向拉伸（2026-10-25 实测）。
+     *
+     * @param needAdapterScreen 车机画面比例与编码比例不一致时请引擎做适配（等比，不拉伸）
+     * @param saveArea 车机安全区 [宽, 高, x, y]；null 表示不声明
+     */
+    fun videoEncoderInfo(
+        width: Int,
+        height: Int,
+        fps: Int,
+        needAdapterScreen: Boolean = false,
+        saveArea: IntArray? = null,
+        drawUIOutsideSafeArea: Boolean = false,
+    ): ByteArray {
+        var out = pbVarint(1, width) + pbVarint(2, height) + pbVarint(3, fps)
+        if (saveArea != null && saveArea.size == 4) {
+            out += pbVarint(4, saveArea[0]) +
+                pbVarint(5, saveArea[1]) +
+                pbVarint(6, saveArea[2]) +
+                pbVarint(7, saveArea[3])
+        }
+        if (drawUIOutsideSafeArea) out += pbVarint(8, 1)
+        if (needAdapterScreen) out += pbVarint(9, 1)
+        return out
+    }
+
+    /** `CarlifeVideoFrameRate{frameRate = 1}`。 */
+    fun videoFrameRate(fps: Int): ByteArray = pbVarint(1, fps)
+
+    /** 模块状态列表回复：把每个模块状态置 1（开启）。 */
+    fun moduleControl(moduleIds: List<Int>): ByteArray {
+        var out = pbVarint(1, moduleIds.size)
+        for (id in moduleIds) {
+            out += pbBytes(2, pbVarint(1, id) + pbVarint(2, 1))
+        }
+        return out
+    }
+
+    /**
+     * 单点触控负载 `CarlifeTouchSinglePoint{x=1, y=2, pointerx=3, pointery=4}`。
+     * 注意动作不在负载里——DOWN/MOVE/UP 分别用 [TOUCH_DOWN]/[TOUCH_MOVE]/[TOUCH_UP]。
+     */
+    fun touchPoint(
+        x: Int,
+        y: Int,
+    ): ByteArray = pbVarint(1, x) + pbVarint(2, y)
+
+    /** 解析 65574 模块状态列表，返回 (moduleId, status) 列表。 */
+    fun parseModuleStatus(payload: ByteArray): List<Pair<Int, Int>> {
+        val result = ArrayList<Pair<Int, Int>>()
+        var index = 0
+        while (index < payload.size) {
+            val tag = payload[index].toInt() and 0xFF
+            index++
+            if (tag == 0x08) {
+                // cnt，跳过
+                while (index < payload.size && (payload[index].toInt() and 0x80) != 0) index++
+                index++
+            } else if (tag == 0x12) {
+                val length = payload[index].toInt() and 0xFF
+                index++
+                val end = (index + length).coerceAtMost(payload.size)
+                var moduleId = 0
+                var status = 0
+                var cursor = index
+                while (cursor < end) {
+                    val subTag = payload[cursor].toInt() and 0xFF
+                    cursor++
+                    when (subTag) {
+                        0x08 -> moduleId = payload[cursor].toInt() and 0xFF
+                        0x10 -> status = payload[cursor].toInt() and 0xFF
+                        else -> break
+                    }
+                    cursor++
+                }
+                result += moduleId to status
+                index = end
+            } else {
+                break
+            }
+        }
+        return result
+    }
+
+    /**
+     * 解析 `CarlifeMediaInfoList`（0x10035 的载荷）为媒体信息列表。
+     *
+     * proto 定义（CarlifeMediaInfoListProto.java）：
+     *   CarlifeMediaInfoList { required int32 cnt = 1; repeated CarlifeMediaInfo mediaInfo = 2; }
+     *   CarlifeMediaInfo     { required string source=1; required string song=2;
+     *                          required string artist=3; required string album=4;
+     *                          required bytes albumArt=5; required int32 duration=6;
+     *                          required int32 playlistNum=7; required string songId=8;
+     *                          required int32 mode=9; }
+     *
+     * 手写 wire 解析（不引 protobuf 运行时）：
+     *   field 1 (cnt)      → tag 0x08 (varint)
+     *   field 2 (mediaInfo)→ tag 0x12 (length-delimited，内嵌完整 CarlifeMediaInfo 子消息)
+     */
+    fun parseMediaInfoList(payload: ByteArray): List<CarLifeMediaInfo> {
+        val result = ArrayList<CarLifeMediaInfo>()
+        var index = 0
+        while (index < payload.size) {
+            val tag = payload[index].toInt() and 0xFF
+            index++
+            when (tag) {
+                0x08 -> {
+                    // cnt（varint），跳过即可
+                    index = skipVarint(payload, index)
+                }
+
+                0x12 -> {
+                    // mediaInfo 子消息（length-delimited）
+                    val length = readVarint(payload, index)
+                    index += varintLen(payload, index)
+                    val end = (index + length).coerceAtMost(payload.size)
+                    parseMediaInfo(payload, index, end)?.let { result += it }
+                    index = end
+                }
+
+                else -> {
+                    // 未知字段：无法安全跳过，停止解析（保护性退出）
+                    return result
+                }
+            }
+        }
+        return result
+    }
+
+    /** 解析单个 CarlifeMediaInfo 子消息；解析不出歌名时返回 null。 */
+    private fun parseMediaInfo(
+        payload: ByteArray,
+        start: Int,
+        end: Int,
+    ): CarLifeMediaInfo? {
+        var source = ""
+        var song = ""
+        var artist = ""
+        var album = ""
+        var albumArt: ByteArray? = null
+        var duration = 0
+        var playlistNum = 0
+        var songId = ""
+        var mode = 0
+        var index = start
+        while (index < end) {
+            val tag = payload[index].toInt() and 0xFF
+            index++
+            val field = tag ushr 3
+            val wireType = tag and 0x07
+            when {
+                // string/bytes（length-delimited, wireType=2）
+                wireType == 2 -> {
+                    val length = readVarint(payload, index)
+                    index += varintLen(payload, index)
+                    val valueEnd = (index + length).coerceAtMost(end)
+                    val bytes = payload.copyOfRange(index, valueEnd)
+                    when (field) {
+                        1 -> source = bytes.toString(Charsets.UTF_8)
+                        2 -> song = bytes.toString(Charsets.UTF_8)
+                        3 -> artist = bytes.toString(Charsets.UTF_8)
+                        4 -> album = bytes.toString(Charsets.UTF_8)
+                        5 -> albumArt = bytes
+                        8 -> songId = bytes.toString(Charsets.UTF_8)
+                    }
+                    index = valueEnd
+                }
+
+                // int32（varint, wireType=0）
+                wireType == 0 -> {
+                    val value = readVarint(payload, index)
+                    index += varintLen(payload, index)
+                    when (field) {
+                        6 -> duration = value
+                        7 -> playlistNum = value
+                        9 -> mode = value
+                    }
+                }
+
+                // wireType=5 (fixed32) 或未知：跳过固定长度/放弃
+                else -> return null
+            }
+        }
+        if (song.isBlank() && artist.isBlank()) return null
+        return CarLifeMediaInfo(source, song, artist, album, albumArt, duration, playlistNum, songId, mode)
+    }
+
+    private fun readVarint(
+        payload: ByteArray,
+        index: Int,
+    ): Int {
+        var result = 0
+        var shift = 0
+        var i = index
+        while (i < payload.size && shift < 35) {
+            val b = payload[i].toInt() and 0xFF
+            result = result or ((b and 0x7F) shl shift)
+            i++
+            if (b and 0x80 == 0) break
+            shift += 7
+        }
+        return result
+    }
+
+    private fun varintLen(
+        payload: ByteArray,
+        index: Int,
+    ): Int {
+        var len = 0
+        var i = index
+        while (i < payload.size && len < 5) {
+            len++
+            if (payload[i].toInt() and 0x80 == 0) break
+            i++
+        }
+        return len
+    }
+
+    private fun skipVarint(
+        payload: ByteArray,
+        index: Int,
+    ): Int = index + varintLen(payload, index)
+
+    private fun writeU16(target: ByteArray, offset: Int, value: Int) {
+        target[offset] = ((value ushr 8) and 0xFF).toByte()
+        target[offset + 1] = (value and 0xFF).toByte()
+    }
+
+    private fun writeU32(target: ByteArray, offset: Int, value: Int) {
+        target[offset] = ((value ushr 24) and 0xFF).toByte()
+        target[offset + 1] = ((value ushr 16) and 0xFF).toByte()
+        target[offset + 2] = ((value ushr 8) and 0xFF).toByte()
+        target[offset + 3] = (value and 0xFF).toByte()
+    }
+}
+
+/** CarLife 车机侧收到的一条媒体信息（0x10035 载荷的单个元素）。 */
+data class CarLifeMediaInfo(
+    val source: String,
+    val song: String,
+    val artist: String,
+    val album: String,
+    val albumArt: ByteArray?,
+    val duration: Int,
+    val playlistNum: Int,
+    val songId: String,
+    val mode: Int,
+)
