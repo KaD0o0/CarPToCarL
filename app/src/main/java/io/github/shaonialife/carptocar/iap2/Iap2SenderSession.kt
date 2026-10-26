@@ -333,20 +333,51 @@ class Iap2SenderSession(
                     },
                 )
                 if (wifiFromExchange == null) {
-                    // 既没有 0x5703、也没有 0x4301 = 一点 AP 信息都没有，继续等只会空转。
-                    throw IOException("未拿到车机热点凭据：该车机既不支持 0x5703，0x4301 也未提供 AP 信息")
+                    // 无 0x5703。分两种情况，前一种不拆链：
+                    if (declaresStartSession == true) {
+                        // 新协议车机（GM/Cinemo、BMW iD9 同族：无 0x5702/0x5703，AP 信息只在
+                        // 0x4301 里）声明会发 0x4301，但窗口内未到。凯迪拉克 CT5 实测
+                        // （2026-10-21 日志，对应上游 PR #19）：8s 窗口全空，旧逻辑拆链重连，
+                        // 6 轮循环车机始终静默、车机屏「无法连接到 CarPlay 请重试」；
+                        // 而真 iPhone 忘掉热点后仍能无线连上——说明车机会经蓝牙把凭据推下来，
+                        // 只是晚发或等前置条件（奥迪 MMI 9310 先例：Phase 1 结束后 2 分 35 秒才发）。
+                        // **不拆链**：返回空端点让主控进入等待态，晚到的 0x4301 由保活泵经
+                        // handleLateStartSession → onEndpointUpdate 重新触发配对。
+                        log(
+                            "iap2 0x4301 窗口内未到但车机声明会发——不拆链，返回空端点进入保活；" +
+                                "晚到 0x4301 将重新触发配对（Audi MMI 9310 先例：2 分 35 秒）",
+                        )
+                        CarPlayEndpoint(
+                            ssid = "",
+                            passphrase = "",
+                            channel = 0,
+                            securityType = 0,
+                            airPlayPort = 0,
+                            deviceIdentifier = null,
+                            publicKey = null,
+                            sourceVersion = null,
+                            ipAddresses = emptyList(),
+                        )
+                    } else {
+                        // 一点线索都没有（车机也没承诺会发 0x4301），继续等只会空转。
+                        throw IOException(
+                            "未拿到车机热点凭据：本轮 0x5702/0x4301 都没给出 AP 信息，" +
+                                "且车机没有声明会发 0x4301（请先在车机上重新选择本机）",
+                        )
+                    }
+                } else {
+                    CarPlayEndpoint(
+                        ssid = wifiFromExchange.ssid,
+                        passphrase = wifiFromExchange.passphrase,
+                        channel = wifiFromExchange.channel,
+                        securityType = wifiFromExchange.securityType,
+                        airPlayPort = 0,
+                        deviceIdentifier = null,
+                        publicKey = null,
+                        sourceVersion = null,
+                        ipAddresses = emptyList(),
+                    )
                 }
-                CarPlayEndpoint(
-                    ssid = wifiFromExchange.ssid,
-                    passphrase = wifiFromExchange.passphrase,
-                    channel = wifiFromExchange.channel,
-                    securityType = wifiFromExchange.securityType,
-                    airPlayPort = 0,
-                    deviceIdentifier = null,
-                    publicKey = null,
-                    sourceVersion = null,
-                    ipAddresses = emptyList(),
-                )
             }
         if (startSession != null) {
             logStartSessionRaw(startSession)
@@ -369,13 +400,18 @@ class Iap2SenderSession(
         // 后续（Phase 2）：加入热点 → mDNS 解析 _airplay._tcp → AirPlay 主会话。
         // 0x5703 缺席时 AP 信息来自 0x4301（已并入 endpoint）——保活期车机重发
         // 0x5703/0x4301 都要用它解析，不能留空。
-        this.wifi =
-            wifiFromExchange ?: WifiConfiguration(
-                ssid = endpoint.ssid,
-                passphrase = endpoint.passphrase,
-                channel = endpoint.channel,
-                securityType = endpoint.securityType,
-            )
+        // 空端点（声明会发 0x4301 但窗口内未到）必须保持 wifi=null：否则保活期
+        // parseStartSession 的 `ap = wifi ?: fromSession` 会用空凭据覆盖晚到 0x4301
+        // 自带的 AP 信息，把唯一的凭据来源丢掉。
+        if (endpoint.ssid.isNotEmpty()) {
+            this.wifi =
+                wifiFromExchange ?: WifiConfiguration(
+                    ssid = endpoint.ssid,
+                    passphrase = endpoint.passphrase,
+                    channel = endpoint.channel,
+                    securityType = endpoint.securityType,
+                )
+        }
         return endpoint
     }
 

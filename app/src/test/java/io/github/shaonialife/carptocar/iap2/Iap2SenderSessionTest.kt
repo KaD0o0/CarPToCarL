@@ -101,6 +101,58 @@ class Iap2SenderSessionTest {
     }
 
     /**
+     * 凯迪拉克 CT5（GM/Cinemo，对应上游 cardeck PR #19）：新协议车机声明会发 0x4301，
+     * 但窗口内未到——**不拆链**，返回空端点进入保活；保活泵把晚到的 0x4301 解析成
+     * 完整端点经 onEndpointUpdate 回调（奥迪 MMI 9310 晚到 2 分 35 秒的同族形态）。
+     *
+     * 旧实现在这里抛 IOException 拆链重连，CT5 实测 6 轮循环车机始终静默、
+     * 车机屏「无法连接到 CarPlay 请重试」——本用例锁住新的不拆链行为。
+     */
+    @Test
+    fun newProtocolCarWithoutCredentialsKeepsLinkForLateStartSession() {
+        val pair = InMemoryStreamPair()
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val accessory = MockAccessory(accessoryChannel, newProtocol = true, lateStartSession = true)
+
+        val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
+        accessoryThread.isDaemon = true
+        accessoryThread.start()
+
+        val updates = AtomicReference<Iap2SenderSession.CarPlayEndpoint?>()
+        val updateLatch = CountDownLatch(1)
+        val session =
+            Iap2SenderSession(
+                phoneChannel,
+                log = { line -> println("PHONE $line") },
+                bluetoothMac = "34:86:DA:BE:EF:01",
+                deviceName = "test-device",
+                onEndpointUpdate = {
+                    updates.set(it)
+                    updateLatch.countDown()
+                },
+            )
+
+        val endpoint = session.run(timeoutMillis = 20_000L)
+        // 没有任何 AP 信息，但车机声明会发 0x4301 —— 返回空端点而不是抛异常
+        assertEquals("", endpoint.ssid)
+
+        val pumpThread = Thread({ session.pumpIncomingForever() }, "phone-pump")
+        pumpThread.isDaemon = true
+        pumpThread.start()
+        assertTrue("晚到 0x4301 未在 10s 内经 onEndpointUpdate 回调", updateLatch.await(10, TimeUnit.SECONDS))
+        val late = updates.get()
+        assertNotNull(late)
+        assertEquals("MockAP", late!!.ssid)
+        assertEquals("secret-passphrase", late.passphrase)
+        assertEquals(49152, late.airPlayPort)
+
+        phoneChannel.close()
+        accessoryChannel.close()
+        pumpThread.join(2_000)
+    }
+
+    /**
      * Audi MMI 0000 形态：0x4301 的地址字段按定长 NUL 填充（IPv6 后 22 个、IPv4 后 5 个）。
      * 旧实现只去掉**一个**尾部 NUL，得到 `"10.174.189.1\0\0\0\0\0"`——它 contains('.')=true、
      * contains(':')=false，能骗过所有「是不是 IPv4」的判断，但 Android 的 getaddrinfo 解不了，
@@ -151,6 +203,11 @@ class Iap2SenderSessionTest {
          * IPv4 后跟 5 个）。用于锁定「必须去掉全部尾部 NUL」这一行为。
          */
         private val padAddresses: Boolean = false,
+        /**
+         * 凯迪拉克 CT5（GM/Cinemo）形态：清单完整但无 0x5702/0x5703，
+         * 且应等到 Phase 1 结束（保活期）才补发 0x4301。
+         */
+        private val newProtocol: Boolean = false,
     ) {
         private val parser = Iap2Csm.Parser()
         private val pending = ArrayDeque<Iap2Csm.Frame>()
@@ -166,6 +223,17 @@ class Iap2SenderSessionTest {
                 Iap2Csm.string(2, "Mock Manufacturer"),
                 if (audiDeclarations) {
                     Iap2Csm.u16List(6, intArrayOf(0x5703, 0xea03))
+                } else if (newProtocol) {
+                    // 凯迪拉克 CT5（GM/Cinemo）实测清单：发 11 项含 0x4301、收 9 项，
+                    // 两个清单都不含 0x57xx —— AP 信息只能在 0x4301 里
+                    Iap2Csm.u16List(
+                        6,
+                        intArrayOf(0xaa06, 0x6800, 0x6802, 0x6803, 0x4c00, 0x4c02, 0x4c03, 0x4c05, 0x5000, 0x5002, 0x4301),
+                    ) +
+                        Iap2Csm.u16List(
+                            7,
+                            intArrayOf(0x6801, 0x4c01, 0x4c04, 0x5001, 0x4e09, 0x4e0a, 0x4e0b, 0x4e0c, 0x4300),
+                        )
                 } else {
                     ByteArray(0)
                 },
@@ -192,19 +260,24 @@ class Iap2SenderSessionTest {
                 expect(Iap2MessageIds.DEVICE_HID_REPORT)
             }
 
-            // WiFi 配置
-            expect(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
+            // WiFi 配置：GM/Cinemo 形态的清单里没有 0x5702，发送端因此根本不会发它
+            if (!newProtocol) {
+                expect(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
+            }
             // 迟到一条订阅请求（真实车机 bring-up 常见：0x5000 与 0x5703 相邻到达）。
             // 它必须被暂存而不是在 expectOrNull 里被反复重读——旧实现把非预期帧塞回
             // 「自己下一轮优先读取」的队列，同一帧无限循环（2026-10-18 日志刷屏根因）。
             send(Iap2MessageIds.START_NOW_PLAYING_UPDATES)
-            send(
-                Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION,
-                Iap2Csm.string(1, "MockAP"),
-                Iap2Csm.string(2, "secret-passphrase"),
-                Iap2Csm.u8(3, 2),
-                Iap2Csm.u8(4, 36),
-            )
+            // GM/Cinemo 形态：没有凭据可发（0x4301 才是唯一来源）
+            if (!newProtocol) {
+                send(
+                    Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION,
+                    Iap2Csm.string(1, "MockAP"),
+                    Iap2Csm.string(2, "secret-passphrase"),
+                    Iap2Csm.u8(3, 2),
+                    Iap2Csm.u8(4, 36),
+                )
+            }
 
             // 设备状态问候（真机顺序：0x4E0D/0x4E0A/0x4E09/0x4E0B/0x4E0C → 0x4300）
             expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
