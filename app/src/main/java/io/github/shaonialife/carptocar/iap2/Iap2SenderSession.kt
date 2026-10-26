@@ -138,6 +138,19 @@ class Iap2SenderSession(
     private var lastNudgeAt = 0L
 
     /**
+     * 上次催问（或发 0x4300）时的对端控制帧计数，用来判断车机是否还在处理我们的帧。
+     *
+     * 2026-10-26 别克 E2LB 日志：车机 ACK 到 0x4e0c 后彻底停摆（只在 RFCOMM 上每秒发
+     * 6 字节封装心跳），而我们的催问会**再补一轮 ACK 待确认的问候**——看门狗 23 秒后
+     * `packet 111 not acknowledged` 拆链，5 分钟保活被切成 42 秒一轮的死循环。
+     * 也就是说：**催问本身就是拆链元凶**。计数没涨 = 车机不处理，就别再喂。
+     */
+    private var lastNudgePeerFrames = -1
+
+    /** 静默期跳过催问的次数（日志节流）。 */
+    private var silentNudgeSkips = 0
+
+    /**
      * 0x1D01 参数 6：车机声明「它可发送」的消息 ID 清单。
      * 用它判断 0x6800 (StartHID) / 0x4301 是否真的会来——声明里没有就不该盲等：
      * 奥迪实测只声明 0x5703/0xea03，旧流程因此在 0x4301 上空等 10s、StartHID 上空等 2s。
@@ -365,6 +378,8 @@ class Iap2SenderSession(
         // 发之前记一次对端控制帧计数：别克 E2LB 实测它收到这一帧后就**彻底不再 ACK**，
         // 用这个计数把「对端还在不在处理我们的帧」量出来（见下方 noteAvailabilitySilence）。
         val framesBeforeAvailability = channel.peerFrameCount
+        // 催问的静默基线也钉在这一刻：第一次催问（+15s）就能判断车机是否还在回帧。
+        lastNudgePeerFrames = framesBeforeAvailability
         sendAvailability()
         // 车机声明里没有 0x4301 就直接跳过等待（Audi 实测每轮白等 10s）：
         // 真 iPhone 对这类车机也不等——AirPlay 端点经 mDNS/网关合成。
@@ -618,12 +633,34 @@ class Iap2SenderSession(
      *
      * 限次（[NUDGE_MAX_TIMES]）而非无限重发：车机若始终不理，继续喂也只会把日志刷满，
      * 5 分钟窗口到点后由主控拆链重连。
+     *
+     * **车机零回帧时直接跳过催问**（见 [lastNudgePeerFrames]）：催问里的问候是 ACK
+     * 待确认的，喂给一个已经不回 ACK 的会话等于自己触发重传看门狗拆链。
      */
     private fun nudgeIfDue() {
         val now = System.currentTimeMillis()
         if (now - lastNudgeAt < NUDGE_INTERVAL_MILLIS) return
         if (nudgeCount >= NUDGE_MAX_TIMES) return
         lastNudgeAt = now
+        // 车机自 0x4300 起一帧都没回（连纯 ACK 都没有）→ 停止催问。
+        // 这不是「少发几条」的问题：催问里的问候走 send()（ACK 待确认），车机不回 ACK，
+        // 重传看门狗 4 次 × ~4s ≈ 23 秒后 `packet N not acknowledged` 拆链——**催问
+        // 本身就是拆链元凶**，把「最长 5 分钟保活」切成 42 秒一轮的重连死循环（别克
+        // E2LB 2026-10-26 实测 6 轮，12 次 0x4300 全部零回应）。
+        // 静默等待反而能接住晚到的 0x4301；一旦对端恢复回帧，下一轮自动恢复催问。
+        val peerFrames = channel.peerFrameCount
+        val peerSilent = lastNudgePeerFrames >= 0 && peerFrames == lastNudgePeerFrames
+        lastNudgePeerFrames = peerFrames
+        if (peerSilent) {
+            silentNudgeSkips++
+            if (silentNudgeSkips == 1 || silentNudgeSkips % 4 == 0) {
+                log(
+                    "iap2 车机零回帧（累计 $peerFrames 帧），跳过第 $silentNudgeSkips 次催问——" +
+                        "不再喂它没反应的帧，链路保持打开等它自己发 0x4301（继续催问会被重传看门狗拆链）",
+                )
+            }
+            return
+        }
         nudgeCount++
         // 先补一轮设备状态问候（上游 PR #17 的「0x5703 分段救援」用的是同一招：
         // 车机不推进时重发问候，而不是干等），再告诉它传输方式，最后重新询问可用性。
@@ -1049,7 +1086,17 @@ class Iap2SenderSession(
         while (true) {
             val remaining = (hidWindowNanos - System.nanoTime()) / 1_000_000L
             if (remaining <= 0) {
-                log("iap2 未收到 0x6800（该接收端不发 StartHID，继续）")
+                // 措辞要看声明：车机在 0x1D01 的发送清单里**有** 0x6800 时（别克 E2LB、
+                // 凯迪拉克 Cinemo 都有）它只是这一刻还没发——写成「该接收端不发 StartHID」
+                // 会让人以为清单没声明，和上面那行「StartHID=会发」自相矛盾。
+                log(
+                    "iap2 ${HID_WAIT_NANOS / 1_000_000_000}s 内未收到 0x6800 StartHID" +
+                        (if (accessoryDeclaresSend(Iap2MessageIds.START_HID) == true) {
+                            "（车机声明会发，可能等 0x4300 之后才开 HID）——继续"
+                        } else {
+                            "（车机未声明清单，按不发处理）——继续"
+                        }),
+                )
                 return
             }
             val frame = recvFrame(remaining)
@@ -1297,7 +1344,42 @@ class Iap2SenderSession(
                     ),
             )
         }
+        logTransportComponents(params)
         log("iap2 0x1d01 原始体=" + frame.body.joinToString("") { "%02x".format(it) })
+    }
+
+    /**
+     * 0x1D01 参数 0x11 / 0x12 / 0x18：车机自报的「传输组件」。
+     *
+     * 实测 Cinemo 栈一族（别克 E2LB、凯迪拉克 CT5，两组字节逐字节相同）：
+     *  - 0x11 子参 0=2 → `CinemoBTComponent`（子参 3 还带一个 `4C:92` 标识）
+     *  - 0x18 子参 0=3 → `CinemoWIFIComponent`
+     *  - 0x12 子参 0=1 → `CinemoHIDRemote`
+     *
+     * 意义：它把「蓝牙 / Wi-Fi / HID 遥控」三个传输都声明出来了，说明这套车机
+     * **硬件与栈层面确实具备无线 CarPlay**，不推进只是应用层没被唤醒（对照它一条
+     * 主动消息都不发）。也留了个待验证问题：0x4300 内层那个 `1` 如果是传输组件号，
+     * WiFi 应为 `3` —— 现在按参考实现发 1，先记下来当下一轮实验项。
+     */
+    private fun logTransportComponents(params: Map<Int, Iap2Csm.Param>) {
+        val groups = intArrayOf(0x11, 0x12, 0x18)
+        val parts = ArrayList<String>(groups.size)
+        for (groupId in groups) {
+            val value = params[groupId]?.value ?: continue
+            val sub = Iap2Csm.parseParams(value).associateBy { it.id }
+            val kindBytes = sub[0]?.value
+            val kind =
+                if (kindBytes == null) {
+                    -1
+                } else if (kindBytes.size >= 2) {
+                    ((kindBytes[0].toInt() and 0xFF) shl 8) or (kindBytes[1].toInt() and 0xFF)
+                } else {
+                    kindBytes[0].toInt() and 0xFF
+                }
+            val name = sub[1]?.value?.asStringOrEmpty() ?: "?"
+            parts += "${name}(id=$kind)"
+        }
+        if (parts.isNotEmpty()) log("iap2 0x1d01 传输组件：" + parts.joinToString(" / "))
     }
 
     private fun remainingMillis(deadlineNanos: Long): Long {
