@@ -236,13 +236,21 @@ class Iap2SenderSession(
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 authentication-succeeded（自报）")
 
+        // ---- 设备状态问候：**紧跟 0xAA05**（上游 PR #17 / BMW iD8.5 实测）----
+        // 车机据这批消息判定「发送端已就绪」，晚发会被当成还没起来。旧实现把它们
+        // 排在 awaitOptionalHid（最多 2s）之后，等于让车机多等 2 秒——凯迪拉克日志里
+        // 0xaa05 在 33.248、问候在 35.249，中间空了 2 秒正是那段 HID 等待。
+        sendDeviceStateGreetings()
+
         // ---- EA 会话启动（MFi 认证完成后）----
         // 奥迪 0x1D01 声明 de.audi.mmicconnectdatatransfer / com.audi.cpp.eadata0/1
         // 三个 EA 协议；触摸 HID 相关数据经 EA 会话。认证前发送会噎死 DiPlay（见上）。
         for ((protocolId, name) in eaProtocols) {
             sendFireAndForget(
                 Iap2MessageIds.EA_OPEN_SESSION,
-                Iap2Csm.u8(0, protocolId) + Iap2Csm.u16(1, protocolId),
+                // param 1 = EA 协议名（UTF-8 字符串）。发成协议号时车机不回 0xEA03
+                // （上游 PR #17 实测修正）。
+                Iap2Csm.u8(0, protocolId) + Iap2Csm.string(1, name),
             )
             log("iap2 tx=0xea00 startEASession protocol=$protocolId name=$name")
         }
@@ -290,30 +298,9 @@ class Iap2SenderSession(
                 }
             }
 
-        // ---- 设备状态问候（对照真 iPhone 实录：0x4E0D/0x4E0A/0x4E09/0x4E0B → 0x4300）----
+        // ---- 设备状态问候（已在 0xAA05 之后立即发过，这里幂等空转）----
         // Audi MIB3 实测：缺这批消息时，车机对 0x4300 只回链路 ACK、不出 0x4301。
-        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
-        send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
-        send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
-        val epochSeconds = System.currentTimeMillis() / 1000L
-        val timezoneMinutes =
-            java.util.TimeZone
-                .getDefault()
-                .getOffset(System.currentTimeMillis()) / 60_000
-        send(
-            Iap2MessageIds.DEVICE_TIME_UPDATE,
-            Iap2Csm.param(0, u64Bytes(epochSeconds)) +
-                Iap2Csm.u16(1, timezoneMinutes and 0xFFFF) +
-                Iap2Csm.u8(2, 0),
-        )
-        send(
-            Iap2MessageIds.DEVICE_UUID_UPDATE,
-            Iap2Csm.string(0, deviceUuid()),
-        )
-        log(
-            "iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
-                "（name=$deviceName mac=$bluetoothMac）",
-        )
+        sendDeviceStateGreetings()
 
         // ---- CarPlay 会话启动 ----
         // 两种对端形态：
@@ -503,6 +490,42 @@ class Iap2SenderSession(
         log("SESSION 保活结束（链路断开）")
     }
 
+    /** 设备状态问候是否已发过（幂等；[sendDeviceStateGreetings] 的 force 可再发一轮）。 */
+    private var greetingsSent = false
+
+    /**
+     * 设备状态问候：0x4E0D 无线会话标识 / 0x4E0A 语言 / 0x4E09 设备名 /
+     * 0x4E0B 设备时间 / 0x4E0C 设备 UUID。
+     *
+     * **必须紧跟 0xAA05**——上游 PR #17（BMW iD8.5 实车）确认车机据这批消息判定
+     * 发送端已就绪；晚发会被当成还没起来。默认只发一次，[force] = true 时再补一轮
+     * （等待 0x4301 期间的催问、0x5703 迟迟不来时的救援都用它）。
+     */
+    private fun sendDeviceStateGreetings(force: Boolean = false) {
+        if (greetingsSent && !force) return
+        greetingsSent = true
+        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+        send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
+        send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
+        val epochSeconds = System.currentTimeMillis() / 1000L
+        val timezoneMinutes =
+            java.util.TimeZone
+                .getDefault()
+                .getOffset(System.currentTimeMillis()) / 60_000
+        send(
+            Iap2MessageIds.DEVICE_TIME_UPDATE,
+            Iap2Csm.param(0, u64Bytes(epochSeconds)) +
+                Iap2Csm.u16(1, timezoneMinutes and 0xFFFF) +
+                Iap2Csm.u8(2, 0),
+        )
+        send(
+            Iap2MessageIds.DEVICE_UUID_UPDATE,
+            Iap2Csm.string(0, deviceUuid()),
+        )
+        val tag = if (force) "（补发）" else ""
+        log("iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候$tag（name=$deviceName mac=$bluetoothMac）")
+    }
+
     /**
      * 等待 0x4301 期间的「催问」：重发 0x4e0e + 0x4300。
      *
@@ -520,7 +543,10 @@ class Iap2SenderSession(
         if (nudgeCount >= NUDGE_MAX_TIMES) return
         lastNudgeAt = now
         nudgeCount++
-        // 0x4E0E 先发：告诉车机「这条 iAP2 会话的传输是蓝牙」，再问一次能不能开始 CarPlay。
+        // 先补一轮设备状态问候（上游 PR #17 的「0x5703 分段救援」用的是同一招：
+        // 车机不推进时重发问候，而不是干等），再告诉它传输方式，最后重新询问可用性。
+        sendDeviceStateGreetings(force = true)
+        // 0x4E0E：告诉车机「这条 iAP2 会话的传输是蓝牙」，再问一次能不能开始 CarPlay。
         sendFireAndForget(
             Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
             Iap2Csm.string(0, bluetoothMac),

@@ -246,6 +246,14 @@ class Iap2SenderSessionTest {
             send(Iap2MessageIds.MFI_RESPONSE, Iap2Csm.param(0, ByteArray(70) { (it * 7).toByte() }))
             expect(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
 
+            // 设备状态问候**紧跟 0xAA05**（2026-10-26 起；上游 PR #17 的结论：
+            // 车机据这批消息判定发送端已就绪，晚发会被当成还没起来）。
+            expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
+            expect(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE)
+            expect(Iap2MessageIds.DEVICE_INFORMATION_UPDATE)
+            expect(Iap2MessageIds.DEVICE_TIME_UPDATE)
+            expect(Iap2MessageIds.DEVICE_UUID_UPDATE)
+
             // 订阅 + StartHID（奥迪形态不发，发送端应直接跳过等待）
             if (!audiDeclarations) {
                 send(Iap2MessageIds.START_NOW_PLAYING_UPDATES)
@@ -279,14 +287,7 @@ class Iap2SenderSessionTest {
                 )
             }
 
-            // 设备状态问候（真机顺序：0x4E0D/0x4E0A/0x4E09/0x4E0B/0x4E0C → 0x4300）
-            expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
-            expect(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE)
-            expect(Iap2MessageIds.DEVICE_INFORMATION_UPDATE)
-            expect(Iap2MessageIds.DEVICE_TIME_UPDATE)
-            expect(Iap2MessageIds.DEVICE_UUID_UPDATE)
-
-            // CarPlay 启动
+            // CarPlay 启动（问候已在 0xAA05 之后收过，此处不再重复期望）
             expect(Iap2MessageIds.CARPLAY_AVAILABILITY)
             if (!lateStartSession) {
                 sendStartSession()
@@ -353,15 +354,33 @@ class Iap2SenderSessionTest {
             }
         }
 
+        /**
+         * 期望收到 [messageId]。
+         *
+         * 允许其间穿插「设备状态问候 / 传输标识 / 可用性」这类**可随时补发**的消息：
+         * 2026-10-26 起问候紧跟 `0xAA05` 发送（上游 PR #17 的结论），而等待 0x4301
+         * 期间还会周期性催问——两者都会打乱「严格一问一答」的脚本。这里改成
+         * 「跳过非目标消息」并记数，跳太多仍然判定失败（防止真的抓错帧）。
+         */
         private fun expect(messageId: Int) {
             println("MOCK expect 0x${messageId.toString(16)}")
-            val frame =
-                recvFrame(10_000)
-                    ?: error("mock timed out waiting 0x${messageId.toString(16)}")
-            check(frame.messageId == messageId) {
-                "mock expected 0x${messageId.toString(16)} got 0x${frame.messageId.toString(16)}"
+            val deadlineAt = System.nanoTime() + 10_000_000_000L
+            var skipped = 0
+            while (System.nanoTime() < deadlineAt) {
+                val frame =
+                    recvFrame(10_000)
+                        ?: error("mock timed out waiting 0x${messageId.toString(16)}")
+                if (frame.messageId == messageId) {
+                    println("MOCK got 0x${frame.messageId.toString(16)}")
+                    return
+                }
+                skipped++
+                println("MOCK skip 0x${frame.messageId.toString(16)}（在等 0x${messageId.toString(16)}）")
+                check(skipped <= 64) {
+                    "mock 等 0x${messageId.toString(16)} 期间跳过了 $skipped 条消息——脚本可能已错位"
+                }
             }
-            println("MOCK got 0x${frame.messageId.toString(16)}")
+            error("mock timed out waiting 0x${messageId.toString(16)}")
         }
 
         private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
