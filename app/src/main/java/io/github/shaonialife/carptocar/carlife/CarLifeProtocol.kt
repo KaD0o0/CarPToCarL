@@ -128,8 +128,15 @@ internal object CarLifeProtocol {
     //   [0..3] 负载长度 BE | [4..7] 时间戳 ms BE | [8..11] 包类型 BE
     // 包类型来自 AudioUtil.EMusicPackageType：INIT=0x30001（负载是 CarlifeMusicInit
     // 原型，宣告采样率/声道/位深），NORMAL=0x30006（负载是裸 PCM）。
+    //
+    // 0x30002 / 0x30003 是**长度 0 的开停信号**（2026-10-26 从真机日志反推，见 docs/audio-call-issues.md）：
+    //   0x30002 出现后立刻来首帧 PCM（10:03:16、10:24:19 两次）；
+    //   0x30003 出现后引擎音频归零（10:21:13、10:31:50 两次，均为来电期间）。
+    // 语义按「开始 / 停止」处理，再往上叠一层兜底（停止后仍收 PCM 照常转发，不靠它裁决）。
     const val AUDIO_HEAD_LEN = 12
     const val MUSIC_PKG_INIT = 0x30001
+    const val MUSIC_PKG_START = 0x30002
+    const val MUSIC_PKG_STOP = 0x30003
     const val MUSIC_PKG_NORMAL = 0x30006
 
     // ---- 帧格式 ----

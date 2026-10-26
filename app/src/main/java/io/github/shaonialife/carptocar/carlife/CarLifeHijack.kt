@@ -80,6 +80,10 @@ object CarLifeHijack {
     private const val MAX_GOP_BYTES = 6 * 1024 * 1024
     private const val MAX_GOP_FRAMES = 240
 
+    /** 画面停摆检查间隔 / 判定阈值（毫秒）。 */
+    private const val STALL_POLL_MILLIS = 2_000L
+    private const val STALL_LOG_MILLIS = 8_000L
+
     private val running = AtomicBoolean(false)
 
     /**
@@ -234,6 +238,14 @@ object CarLifeHijack {
     private var recvWindowKeys = 0
     private var recvWindowBytes = 0
 
+    /** 最近一次收到 CarLife 视频帧的时刻（uptimeMillis）；0 = 本轮还没收到过。 */
+    @Volatile
+    private var lastSourceFrameAt = 0L
+
+    /** 本次停摆的起点（0 = 当前没在停摆）。用于「只记一次 + 恢复时报时长」。 */
+    @Volatile
+    private var stallSince = 0L
+
     /** 车机通道是否已接上（画面正在直通）。 */
     val isAttached: Boolean get() = sender != null
 
@@ -296,6 +308,8 @@ object CarLifeHijack {
         observedMaxX = 0
         observedMaxY = 0
         hasVideo = false
+        lastSourceFrameAt = 0L
+        stallSince = 0L
         requestedFps = context
             .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getInt(KEY_FPS, DEFAULT_FPS)
@@ -317,6 +331,7 @@ object CarLifeHijack {
             isDaemon = true
             start()
         }
+        startStallWatchdog()
         MediaSessionsState.addListener(mediaPlaybackListener)
         return true
     }
@@ -399,6 +414,8 @@ object CarLifeHijack {
         worker = null
         logSink = null
         hasVideo = false
+        lastSourceFrameAt = 0L
+        stallSince = 0L
         synchronized(gopLock) {
             gop.clear()
             gopBytes = 0
@@ -444,6 +461,7 @@ object CarLifeHijack {
                 onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
                 onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
                 onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
+                onAudioGate = { active -> onEngineAudioGate(active) },
                 onMediaInfo = { info -> onMediaInfo(info) },
                 requestedFps = requestedFps,
                 connectType = connectType,
@@ -503,6 +521,63 @@ object CarLifeHijack {
         }.apply { isDaemon = true }.start()
     }
 
+    /**
+     * 引擎音频开停信号（0x30002 开始 / 0x30003 停止）。
+     *
+     * 真机时间线（2026-10-26）：来电时引擎发 0x30003，之后音频整段归零；挂断并恢复播放
+     * 才发 0x30002。停过一段再恢复时，车机手里的 RTP↔NTP 锚点已经超时，恢复瞬间开头
+     * 几百毫秒容易被丢——所以恢复时补发一轮同步包重新对齐。这里**不拦 PCM**：
+     * 万一信号语义判断有误，音频照常转发，不会因为猜错把声音弄没。
+     */
+    private fun onEngineAudioGate(active: Boolean) {
+        if (!active) {
+            logSink?.invoke("CARLIFE: 引擎音频已停（来电 / 音频路由被切走）——车机侧这一段会静音")
+            return
+        }
+        val audio = io.github.shaonialife.carptocar.SessionController.audioSender
+        if (audio != null && audio.isRunning) {
+            audio.resyncAnchor("引擎音频恢复")
+        } else {
+            logSink?.invoke("CARLIFE: 引擎音频恢复，但音频通道未在运行——跳过重新对齐")
+        }
+    }
+
+    /**
+     * 画面源停摆看门狗（只观测，不干预）。
+     *
+     * 来电时手机侧画面被通话界面占用（系统安全窗口不可录），CarLife 引擎几乎不出帧，
+     * 车机表现为**黑屏**。这里 8 秒没有新帧就记一条带时长的日志，恢复时再记一条，
+     * 用来区分「引擎真没画面」与「链路/车机侧解码问题」——两者处置完全不同。
+     * 不主动重建编码器：通话期间根本没有画面可编，硬重建只会把水搅浑。
+     */
+    private fun startStallWatchdog() {
+        Thread {
+            while (running.get()) {
+                try {
+                    Thread.sleep(STALL_POLL_MILLIS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (!running.get()) return@Thread
+                if (sender == null) continue // 还没连车机，不统计
+                val last = lastSourceFrameAt
+                if (last == 0L || stallSince > 0) continue
+                val now = android.os.SystemClock.uptimeMillis()
+                val idle = now - last
+                if (idle < STALL_LOG_MILLIS) continue
+                stallSince = last
+                logSink?.invoke(
+                    "CARLIFE: 画面源停摆 ${idle / 1000} 秒——引擎这段时间几乎不出帧" +
+                        "（来电/锁屏时手机侧画面被占用，车机会黑屏；恢复后会补关键帧）",
+                )
+            }
+        }.apply {
+            isDaemon = true
+            name = "carlife-stall-watch"
+            start()
+        }
+    }
+
     /** 一节视频帧：有会话就直通，没有就缓存（从关键帧开始）。 */
     private fun onFrame(
         data: ByteArray,
@@ -511,6 +586,14 @@ object CarLifeHijack {
         recvWindowFrames++
         recvWindowBytes += data.size
         if (keyFrame) recvWindowKeys++
+        // 停摆检测的打卡点（来电时引擎会整段不出帧，只能靠这里判断「是源没画面」还是链路断）
+        val now = android.os.SystemClock.uptimeMillis()
+        lastSourceFrameAt = now
+        val stalledSince = stallSince
+        if (stalledSince > 0) {
+            stallSince = 0
+            logSink?.invoke("CARLIFE: 画面源恢复（停摆 ${(now - stalledSince) / 1000} 秒）")
+        }
         if (!hasVideo && data.isNotEmpty()) {
             hasVideo = true
             // 独立于一会话：还没连车机时也要能看出「CarLife 到底在不在推流」。

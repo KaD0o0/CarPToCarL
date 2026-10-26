@@ -39,6 +39,15 @@ class CarLifeHuClient(
     private val onAudioFormat: (sampleRate: Int, channels: Int) -> Unit = { _, _ -> },
     /** 收到一包裸 PCM（16bit 交织，size 为有效字节数）。 */
     private val onAudioPcm: (pcm: ByteArray, size: Int) -> Unit = { _, _ -> },
+    /**
+     * 引擎音频**开停信号**（0x30002 开始 / 0x30003 停止，长度 0 的裸类型包）。
+     *
+     * 真机实证（2026-10-26，奥迪 MIB3）：这两个包出现在「引擎音频真正开始/停止推 PCM」
+     * 的同一瞬间——来电期间只有 0x30003、挂断恢复播放时才有 0x30002。上层据此在恢复时
+     * 补发同步包重新对齐车机时钟（[io.github.shaonialife.carptocar.audio.AudioSender.resyncAnchor]）。
+     * 只当「信号」用，不作为是否转发 PCM 的裁决——停止后万一还有 PCM 仍然照常转发。
+     */
+    private val onAudioGate: (active: Boolean) -> Unit = {},
     /** 收到手机推送的媒体信息（歌名/歌手/封面，0x10035）。 */
     private val onMediaInfo: (info: CarLifeMediaInfo) -> Unit = {},
     private val connectTimeoutMs: Int = 3_000,
@@ -884,6 +893,18 @@ class CarLifeHuClient(
                             onAudioFormat(DEFAULT_AUDIO_RATE, 2)
                         }
                         if (length > 0) onAudioPcm(payload, length)
+                    }
+
+                    // 引擎音频开停信号（长度 0）：来电/路由切换时引擎会先发 STOP，
+                    // 挂断恢复播放再发 START。只上报，不拦截音频。
+                    CarLifeProtocol.MUSIC_PKG_START -> {
+                        log("CARLIFE: $label 引擎音频开始（0x30002）")
+                        onAudioGate(true)
+                    }
+
+                    CarLifeProtocol.MUSIC_PKG_STOP -> {
+                        log("CARLIFE: $label 引擎音频停止（0x30003）——来电或音频路由被切走")
+                        onAudioGate(false)
                     }
 
                     else -> {

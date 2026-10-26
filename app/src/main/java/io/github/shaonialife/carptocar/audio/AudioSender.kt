@@ -112,6 +112,15 @@ class AudioSender(
     private var thread: Thread? = null
     private var syncThread: Thread? = null
 
+    /** 同步包序号（跨重试连续，避免车机把重发当成乱序丢掉）。 */
+    private var syncSequence = 0
+
+    /** 同步包连续失败次数（诊断 + 决定何时重开套接字）。 */
+    private var syncFailures = 0
+
+    /** 首个同步包（X 位=1）是否已成功发出。 */
+    private var syncFirstSent = false
+
     /** AAC-LC 编码器（仅 [AudioCodec.AAC_LC] 时创建）。 */
     private var aacEncoder: AacLcEncoder? = null
 
@@ -524,44 +533,100 @@ class AudioSender(
 
     // ---- 音频同步包（RTP 时间戳 ↔ NTP，每秒一个） ----
 
+    /**
+     * 打开同步包套接字（连接式 UDP：连上之后才能收到 ICMP 端口不可达）。
+     * 失败返回 null（例如车机下发的 controlPort 非法）。
+     */
+    private fun openSyncSocket(): DatagramSocket? =
+        try {
+            DatagramSocket().apply { connect(InetAddress.getByName(host), controlPort) }
+        } catch (error: Exception) {
+            log("AUDIO: 同步包套接字创建失败 - ${error.message}")
+            null
+        }
+
+    /**
+     * 发一个同步包。**失败不再终止同步线程**。
+     *
+     * 2026-10-26 实证（奥迪 MIB3）：音频 SETUP 后 1 秒，第一个同步包引发
+     * `ECONNREFUSED`（车机此刻还没在 controlPort 上监听），旧实现 `catch` 后直接
+     * 退出线程 —— 整场会话再没有任何同步包，RTP↔NTP 锚点永久缺失。
+     * 连接式 UDP 的 ICMP 错误是一次性的，继续发往往就能成功，所以这里只记数不放弃：
+     *  - 前 3 次逐条记，之后每 60 次记一条，避免刷屏；
+     *  - 连续失败满 10 次重开套接字（车机侧可能换了监听 socket）。
+     */
+    @Synchronized
+    private fun sendSyncOnce(first: Boolean): Boolean {
+        val client = syncSocket ?: return false
+        return try {
+            val next = timestamp
+            val current = (next - samplesPerPacket).coerceAtLeast(0L)
+            val ntp = TimingServer.ntpFromNanos(System.nanoTime())
+            val packet = AudioSyncPacket.build(syncSequence, current, next, ntp, first)
+            client.send(DatagramPacket(packet, packet.size))
+            syncSequence = (syncSequence + 1) and 0xFFFF
+            if (syncFailures > 0) {
+                log("AUDIO: 同步包恢复（连续失败 $syncFailures 次后发出）——锚点重建")
+                syncFailures = 0
+            }
+            true
+        } catch (error: Exception) {
+            syncFailures++
+            if (syncFailures <= 3 || syncFailures % 60 == 0) {
+                log(
+                    "AUDIO: 同步包发送失败（第 $syncFailures 次）- ${error.message}" +
+                        "——继续每秒重试，不放弃锚点",
+                )
+            }
+            if (syncFailures % 10 == 0) {
+                runCatching { client.close() }
+                syncSocket = openSyncSocket()
+            }
+            false
+        }
+    }
+
+    /**
+     * 立刻补发一轮同步包，让车机重新对齐 RTP↔NTP。
+     *
+     * 用在「引擎音频停过一段又恢复」（来电结束、音频路由切回）之后：车机长时间收不到
+     * 音频会把锚点判超时，恢复瞬间只按到达时刻猜，容易出现开头几百毫秒被丢/爆音。
+     */
+    @Synchronized
+    fun resyncAnchor(reason: String) {
+        if (!running.get() || controlPort <= 0 || syncSocket == null) return
+        var sent = 0
+        repeat(3) { if (sendSyncOnce(false)) sent++ }
+        log("AUDIO: $reason → 补发 $sent 个同步包重新对齐车机时钟")
+    }
+
     private fun startSyncLoop() {
         if (controlPort <= 0) {
             log("AUDIO: 车机未下发 controlPort——不发同步包（只能靠音频包自带时间戳）")
             return
         }
-        val client =
-            try {
-                DatagramSocket().apply { connect(InetAddress.getByName(host), controlPort) }
-            } catch (error: Exception) {
-                log("AUDIO: 同步包套接字创建失败 - ${error.message}")
-                return
-            }
+        val client = openSyncSocket() ?: return
         syncSocket = client
         log("AUDIO: 同步包已启用 → $host:$controlPort（每 ${SYNC_INTERVAL_MILLIS}ms 一个，建立 RTP↔NTP 锚点）")
         val worker =
             Thread(
                 {
-                    var syncSequence = 0
-                    var first = true
-                    try {
-                        while (running.get() && !client.isClosed) {
-                            val next = timestamp
-                            val current = (next - samplesPerPacket).coerceAtLeast(0L)
-                            val ntp = TimingServer.ntpFromNanos(System.nanoTime())
-                            val packet = AudioSyncPacket.build(syncSequence, current, next, ntp, first)
-                            client.send(DatagramPacket(packet, packet.size))
-                            syncSequence = (syncSequence + 1) and 0xFFFF
-                            if (first) {
-                                first = false
-                                log(
-                                    "AUDIO: 首个同步包已发出（X 位=1）ts=$current→$next——" +
-                                        "车机若仍无声，说明它没在等这个锚点",
-                                )
-                            }
-                            Thread.sleep(SYNC_INTERVAL_MILLIS)
+                    // 注意：**不能**在循环条件里判 `client.isClosed`——连续失败时
+                    // sendSyncOnce 会把套接字关掉重开，那个判断会让线程直接退出。
+                    while (running.get()) {
+                        val sent = sendSyncOnce(first = !syncFirstSent)
+                        if (sent && !syncFirstSent) {
+                            syncFirstSent = true
+                            log(
+                                "AUDIO: 首个同步包已发出（X 位=1）——" +
+                                    "车机若仍无声，说明它没在等这个锚点",
+                            )
                         }
-                    } catch (error: Exception) {
-                        if (running.get()) log("AUDIO: 同步包发送停止 - ${error.message}")
+                        try {
+                            Thread.sleep(SYNC_INTERVAL_MILLIS)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
                     }
                 },
                 "audio-sync",
