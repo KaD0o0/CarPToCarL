@@ -102,6 +102,17 @@ class Iap2SenderSession(
     /** 0x4301 原始体是否已记录（每轮会话一次，避免周期补发刷屏）。 */
     private var startSessionRawLogged = false
 
+    /** 0x1D01 得到的车机身份文本——[AvailabilityBodyMemory] 的键（空 = 还没识别）。 */
+    private var receiverIdentity: String = ""
+
+    /**
+     * 本轮 0x4300 用的报文体形态。
+     *
+     * null = 不启用试错阶梯（没有 Context：单测/纯 JVM），一律用新版嵌套体，行为与
+     * 改动前一致。真机有 Context 时由 [AvailabilityBodyMemory.nextVariant] 决定。
+     */
+    private var availabilityVariant: AvailabilityBodyMemory.Variant? = null
+
     /** 最近一次晚到 0x4301 的端点指纹（车机周期重发相同内容时不重复打详情）。 */
     private var lastLateStartSessionSignature: Int? = null
 
@@ -247,6 +258,18 @@ class Iap2SenderSession(
 
         // ---- MFi（跳过校验：0xAA05 自报成功）----
         val identityText = identityText(identification)
+        // 0x4300 报文体形态的按车机试错记忆（见 AvailabilityBodyMemory 文档：
+        // 别克 E2LB 收到新版嵌套体后控制会话直接停摆）。无 Context（单测）时固定新版。
+        receiverIdentity = identityText
+        // 只有真机（有 Context，可持久化）才启用阶梯；单测/纯 JVM 固定新版嵌套体，
+        // 协议时序与改动前完全一致（也让用例之间不会通过进程内记忆互相污染）。
+        availabilityVariant = if (context == null) null else AvailabilityBodyMemory.nextVariant(context, identityText)
+        availabilityVariant?.let {
+            log(
+                "iap2 0x4300 报文体形态：${it.label}" +
+                    "（该车机历史静默档=${AvailabilityBodyMemory.silentDescription(context, identityText)}）",
+            )
+        }
         val legacyCar = LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
         if (legacyCar) {
             log("iap2 识别为真车系（$identityText）——MFi 首选 20B（真 iPhone 实录长度；32B 对真车处置不稳定）")
@@ -339,10 +362,10 @@ class Iap2SenderSession(
         //    超时返回无端点的 CarPlayEndpoint，由主控 mDNS 合成。
         // 0x4300 同样发后不管：2026-10-11 12:52 轮实测车机曾对它停止 ACK
         // （事件通道 SYN 洪水把它打懵的时段），链路看门狗险些再次自杀。
-        sendFireAndForget(
-            Iap2MessageIds.CARPLAY_AVAILABILITY,
-            Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
-        )
+        // 发之前记一次对端控制帧计数：别克 E2LB 实测它收到这一帧后就**彻底不再 ACK**，
+        // 用这个计数把「对端还在不在处理我们的帧」量出来（见下方 noteAvailabilitySilence）。
+        val framesBeforeAvailability = channel.peerFrameCount
+        sendAvailability()
         // 车机声明里没有 0x4301 就直接跳过等待（Audi 实测每轮白等 10s）：
         // 真 iPhone 对这类车机也不等——AirPlay 端点经 mDNS/网关合成。
         val declaresStartSession = accessoryDeclaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
@@ -361,6 +384,13 @@ class Iap2SenderSession(
                     Iap2MessageIds.CARPLAY_START_SESSION,
                     minOf(deadline, System.nanoTime() + startSessionWindow),
                 )
+        }
+        // 静默判定只在这条路上有意义：新协议车机（没有 0x5703）+ 声明会发 0x4301 + 没等到。
+        // 老协议车机（Audi 等）对 0x4300 的处置不影响后续流程，不做阶梯，避免回归。
+        if (startSession == null && declaresStartSession == true && wifiFromExchange == null) {
+            noteAvailabilitySilence(framesBeforeAvailability, startSessionWindow)
+        } else if (startSession != null) {
+            availabilityVariant?.let { AvailabilityBodyMemory.recordSuccess(context, receiverIdentity, it) }
         }
         val endpoint =
             if (startSession != null) {
@@ -609,14 +639,81 @@ class Iap2SenderSession(
                 Iap2Csm.string(0, bluetoothMac),
             )
         }
-        sendFireAndForget(
-            Iap2MessageIds.CARPLAY_AVAILABILITY,
-            Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
-        )
+        sendAvailability()
         // 第 1 次必记（确认机制真的跑了），之后每 4 次记一条，避免刷屏。
         if (nudgeCount == 1 || nudgeCount % 4 == 0) {
             log("iap2 催问第 $nudgeCount 次：重发问候 + 0x4e0e + 0x4300（按车机声明裁剪后发送）——车机仍未下发 0x4301，链路正常保活中")
         }
+    }
+
+    /**
+     * 发 `0x4300`（CarPlay 可用性），按本轮选定的报文体形态。
+     *
+     * 三种形态来自参考实现（CarWith-CarPlay）的 `useModernAvailabilityBody` 分档：
+     *  - [AvailabilityBodyMemory.Variant.MODERN_NESTED]：`param1 = {param0={1}, param1=transportId}`
+     *    —— 24 款档，也是我们一直用的、凯迪拉克/DiPlay 都认的形态；
+     *  - [AvailabilityBodyMemory.Variant.LEGACY_FLAT]：`param0={1}` + DeviceIdentifier 字符串
+     *    （`00008110` + MAC 去冒号大写 + `0000`），参考实现**原样与全小写各发一份**
+     *    （老车机对大小写敏感），我们照抄；
+     *  - [AvailabilityBodyMemory.Variant.NONE]：23 款档根本不发——这批车机疑似不吃任何形态。
+     *
+     * 都是发后不管（[sendFireAndForget]）：0x4300 曾被实测「ACK 但有车机从此沉默」，
+     * 进重传队列只会让看门狗提前把链路杀掉。
+     */
+    private fun sendAvailability() {
+        when (availabilityVariant ?: AvailabilityBodyMemory.Variant.MODERN_NESTED) {
+            AvailabilityBodyMemory.Variant.MODERN_NESTED ->
+                sendFireAndForget(
+                    Iap2MessageIds.CARPLAY_AVAILABILITY,
+                    Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
+                )
+
+            AvailabilityBodyMemory.Variant.LEGACY_FLAT -> {
+                val identifier = legacyDeviceIdentifier()
+                val flat = { value: String -> Iap2Csm.u8(0, 1) + Iap2Csm.string(1, value) }
+                sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, flat(identifier))
+                sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, flat(identifier.lowercase()))
+            }
+
+            AvailabilityBodyMemory.Variant.NONE ->
+                log("iap2 0x4300 本轮不发（该车机对两种报文体都无反应——只等它自己发 0x4301）")
+        }
+    }
+
+    /**
+     * 判定「0x4300 是否把车机的控制会话打住了」，并据此推进报文体阶梯。
+     *
+     * 判据：从发出 0x4300 到整个等待窗口结束，[Iap2LinkChannel.peerFrameCount] 一次都没涨
+     * ——连纯 ACK 都没有。2026-10-26 别克 E2LB 日志就是这种形态：ACK 停在 0x4e0c，
+     * 之后 23 秒只有 `ff 55 02 00 ee 10` 链路心跳，最后我方看门狗
+     * `packet N not acknowledged` 拆链 → 每 40 秒一轮死循环。
+     *
+     * 注意：这不是「车机不发 0x4301」的证据（这个家族从来不发），只是「它不认这一帧」
+     * 的证据。所以判到静默就换下一档，而不是断言此路不通。
+     */
+    private fun noteAvailabilitySilence(
+        framesBefore: Int,
+        windowNanos: Long,
+    ) {
+        val variant = availabilityVariant ?: return
+        if (variant == AvailabilityBodyMemory.Variant.NONE) return
+        val framesAfter = channel.peerFrameCount
+        if (framesAfter != framesBefore) return
+        val next = AvailabilityBodyMemory.recordSilent(context, receiverIdentity, variant)
+        log(
+            "iap2 ⚠ 0x4300（${variant.label}）发出后 ${windowNanos / 1_000_000_000}s 内车机零反馈：" +
+                "连链路层 ACK 都没回（同一份字节在凯迪拉克 CADILLAC_7731 上是正常 ACK 的），" +
+                "疑似该固件不认这个报文体；已记为静默，下一轮改用「${next.label}」",
+        )
+    }
+
+    /**
+     * 老版可用性报文里的 DeviceIdentifier（参考实现 `Ct5Variants` 的拼法）：
+     * `00008110` + 本机蓝牙 MAC（去冒号、大写）+ `0000`；MAC 形态不对时用参考实现的兜底值。
+     */
+    private fun legacyDeviceIdentifier(): String {
+        val mac = bluetoothMac.filter { it.isLetterOrDigit() }.uppercase()
+        return if (mac.length == 12) "00008110${mac}0000" else "00008110000105201EDA801E"
     }
 
     /**

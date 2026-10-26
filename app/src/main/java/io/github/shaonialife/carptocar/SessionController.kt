@@ -43,6 +43,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 进程级会话中枢：**日志缓冲**与**会话管线所有权**的唯一持有者。
@@ -455,6 +456,29 @@ object SessionController {
     var connectCancelled: Boolean = false
 
     /**
+     * 空端点等待观察者的**代际**：每新起一个就自增，旧观察者看到代际变化即退出。
+     *
+     * 2026-10-26 别克 E2LB 日志：车机每 ~40 秒把链路掐掉一次（收到 0x4300 后停止 ACK，
+     * 我方重传看门狗拆链），每次重连都新起一个观察者而旧的只认 connectCancelled——
+     * 于是 5 轮之后同一时刻有 5 个观察者在跑，日志里同时出现「已等 30s / 61s / 122s /
+     * 153s」，看起来像时间倒流。
+     */
+    private val pendingWatchGeneration = AtomicInteger(0)
+
+    /**
+     * 一次「启动连接」内的等待预算起点（[PENDING_START_SESSION_WAIT_MS] 从这次点击算起）。
+     *
+     * 不能每轮会话重置：车机反复断链重连时，旧实现每轮重新计 5 分钟，等于**永不超时**，
+     * 用户看到的「最多等 5 分钟」是假的，连接会一直原地打转。
+     */
+    @Volatile
+    private var pendingWaitBudgetStartedAt: Long = 0L
+
+    /** 本周期的等待预算已耗尽：后续观察者不再重复拆链/刷日志，等用户重新点「启动连接」。 */
+    @Volatile
+    private var pendingWaitGaveUp: Boolean = false
+
+    /**
      * 当前连接阶段的一句话提示（英雄卡副标题用，详细过程看日志）。
      * 由各阶段显式设置；null 时 UI 显示默认文案。
      */
@@ -589,6 +613,9 @@ object SessionController {
      */
     fun startConnection(context: Context) {
         connectCancelled = false
+        // 新一次用户点击 = 新的 5 分钟等待预算（断链重连不再重置，见 pendingWaitBudgetStartedAt）
+        pendingWaitBudgetStartedAt = 0L
+        pendingWaitGaveUp = false
         phaseHint = "蓝牙就绪，等待车机回连…"
         // 新会话 = 新的 NowPlaying 上下文：清去重键，否则同一首歌重连后不会被重推
         resetNowPlayingDedupe()
@@ -1225,23 +1252,32 @@ object SessionController {
         endpoint: Iap2SenderSession.CarPlayEndpoint,
         source: String,
     ) {
+        // 代际：新观察者一起，前面所有观察者作废（每次断链重连都会新起一个）。
+        val generation = pendingWatchGeneration.incrementAndGet()
         Bg.run("pending-start-session-watch") {
+            if (pendingWaitGaveUp) {
+                // 本周期的预算已耗尽，不重复刷日志/重复拆链（旧实现会在此无限循环）。
+                return@run
+            }
             // 英雄卡副标题同步：否则界面一直显示默认的「蓝牙 iAP2 握手 → …」，
             // 用户看到的是「一直在握手」，实际早已连上、在等车机下发凭据。
             phaseHint = "已连上车机，正在等它下发热点信息（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· 请保持 Wi-Fi 开启"
             appendLog(
                 ">>> [$source] 进入保活等待：车机声明会发 0x4301 但窗口内未到。" +
-                    "蓝牙链路保持（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟），" +
+                    "蓝牙链路保持（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟，从点「启动连接」算起），" +
                     "期间请保持手机 Wi-Fi 开启；车机多数要看到手机进入它自己的网络后才会下发凭据",
             )
             var promptedSsid: String? = null
-            val watchStartedAt = android.os.SystemClock.uptimeMillis()
+            // 预算从**用户点击**算起：车机反复断链重连时不能每轮重新计 5 分钟（否则永不超时）。
+            if (pendingWaitBudgetStartedAt == 0L) pendingWaitBudgetStartedAt = android.os.SystemClock.uptimeMillis()
+            val watchStartedAt = pendingWaitBudgetStartedAt
             val deadline = watchStartedAt + PENDING_START_SESSION_WAIT_MS
             var tick = 0
             while (!connectCancelled && android.os.SystemClock.uptimeMillis() < deadline) {
                 Thread.sleep(5_000)
                 tick++
                 if (connectCancelled) return@run
+                if (pendingWatchGeneration.get() != generation) return@run
                 // 晚到 0x4301 已触发新一轮交接——观察任务让位。
                 if (sessionStarting.get()) return@run
                 val (wifiEnabled, currentSsid) = shellWifiStatus()
@@ -1279,10 +1315,14 @@ object SessionController {
                     return@run
                 }
             }
-            if (!connectCancelled && !sessionStarting.get()) {
+            if (!connectCancelled && !sessionStarting.get() && pendingWatchGeneration.get() == generation) {
+                pendingWaitGaveUp = true
+                phaseHint = "车机未下发热点信息（0x4301），本轮已停止重试"
                 appendLog(
                     ">>> [$source] 空端点等待 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟超时——" +
-                        "车机未下发 0x4301。拆掉保活链路让重连循环接管，请导出日志反馈",
+                        "车机始终未下发 0x4301（0x4300 各种报文体都试过了，见上方「0x4300 报文体形态」与" +
+                        "「⚠ 零反馈」两行）。先拆掉保活链路停止空转；确认车机开了无线 CarPlay 后再点" +
+                        "「启动连接」，并把日志发出来",
                 )
                 detachActiveBtSessions()
             }

@@ -35,6 +35,17 @@ class Iap2LinkChannel(
 
     val isAlive: Boolean get() = !terminated
 
+    /**
+     * 对端**控制帧**计数（任何 ctl 帧，含纯 ACK）；链路层心跳 `ff 55 02 00 ee 10` 不计。
+     *
+     * 用途：判断「车机是否还在处理我们发的帧」。2026-10-26 别克 E2LB 实测：发出 0x4300
+     * 之后该计数再也不动，但 RFCOMM 连接还活着（心跳照发）——即车机的控制会话已经停摆，
+     * 而不是链路断开。会话层据此把「对 0x4300 的报文体不兼容」记下来并自动换形态。
+     */
+    @Volatile
+    var peerFrameCount: Int = 0
+        private set
+
     init {
         engine.onPeerSynchronizationAdopted = { sync ->
             log(
@@ -46,6 +57,7 @@ class Iap2LinkChannel(
             log("LINK: 丢弃未知会话 $sessionId 的数据帧（$size 字节）")
         }
         engine.onFrameReceived = { control, sequence, ack, sessionId, size ->
+            peerFrameCount++
             // 真车调试关键观测：车机在识别阶段是否回帧、回什么（静默分歧全靠它定位）
             if (rxFrameLogs < FRAME_LOG_LIMIT) {
                 rxFrameLogs++
