@@ -537,6 +537,17 @@
                             android:textColorHint="#5A6B7A"
                             android:textSize="13.5sp"
                             android:textStyle="bold" />
+
+                        <!-- 门禁提示：未填写时红色告警（未填写不给启动连接） -->
+                        <TextView
+                            android:id="@+id/tvMacHint"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="3dp"
+                            android:text="未填写 —— 不填写本机蓝牙地址将无法启动连接"
+                            android:textColor="@color/m3_error"
+                            android:textSize="11.5sp"
+                            android:visibility="gone" />
                     </LinearLayout>
 
                     <TextView

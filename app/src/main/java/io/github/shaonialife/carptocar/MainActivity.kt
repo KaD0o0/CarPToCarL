@@ -67,6 +67,18 @@ class MainActivity : AppCompatActivity() {
     private companion object {
         const val DEFAULT_CONNECTING_HINT = "蓝牙 iAP2 握手 → 加入车机热点 → 建立 CarPlay 会话"
         const val KEY_DISCLAIMER_DEADLINE = "disclaimer_deadline"
+
+        /** 本机蓝牙地址未填写：英雄卡副标题与输入框下方提示共用同一句。 */
+        const val HINT_MAC_MISSING = "本机蓝牙地址未填写 —— 请先在下方填写并保存"
+
+        /** 未填写时被拦下的 Snackbar 文案。 */
+        const val TIP_MAC_MISSING = "本机蓝牙地址未填写 —— 请先在「连接准备」里填写并保存"
+
+        /** 地址就绪时的英雄卡副标题（与「未填写」提示互斥）。 */
+        const val HINT_IDLE_READY = "与车机蓝牙完成配对后，点击下方按钮发起无线连接"
+
+        /** 「启动连接」被门禁拦下时的视觉强度（不透明度）。 */
+        const val CTA_BLOCKED_ALPHA = 0.45f
     }
 
     private lateinit var deviceSubtitle: TextView
@@ -86,6 +98,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var readyCount: TextView
     private lateinit var ssidInput: EditText
     private lateinit var macInput: EditText
+    private lateinit var tvMacHint: TextView
     private lateinit var btDesc: TextView
     private lateinit var btBadge: TextView
     private lateinit var btnPickTarget: TextView
@@ -347,10 +360,88 @@ class MainActivity : AppCompatActivity() {
      * 「启动连接」放行检查。
      *
      * 旧实现这里是 Shizuku 硬门禁（虚拟屏/注入都靠它）。2026-10-24 起 Shizuku 依赖
-     * 整体移除，画面唯一来源是本机 CarLife 直通，因此这里直接放行。
+     * 整体移除，画面唯一来源是本机 CarLife 直通。
+     *
+     * 2026-10-26 起这里加了**本机蓝牙地址硬门禁**：地址是整个链路的设备身份
+     * （0x4300/0x4E0E、AirPlay SETUP、ctrl 广播 id 都用它），没有它连上去接收端
+     * 只会回 SETUP 403，用户看到的却是一句「连接失败」，无从下手。所以未填写时
+     * 直接拦下并提示，而不是让他白等一轮。
+     *
+     * 放在这里而不是按钮的点击回调里，是因为所有入口（手动点、启动后自动连接、
+     * 蓝牙/位置权限授权后续跑）都汇到这一个函数，改一处即可全覆盖。
      */
     private fun proceedToConnect(onReady: () -> Unit) {
+        if (!requireBluetoothMac()) return
         onReady()
+    }
+
+    /**
+     * 当前可用的本机蓝牙地址：手填优先 → 已解析缓存。都没有返回 null。
+     *
+     * 只读缓存（[DeviceIdentity.cachedBluetoothMac]），**不**触发 shell 解析——
+     * 本方法在 UI 线程上每次 tick 都可能被调用，绝不能再花 4 秒去 `content query`。
+     * onCreate 已经用完整解析跑过一轮，正常机型这里能直接拿到真实地址。
+     */
+    private fun effectiveBluetoothMac(): String? =
+        DeviceIdentity.normalize(macInput.text.toString())
+            ?: DeviceIdentity.overrideBluetoothMac(this)
+            ?: DeviceIdentity.cachedBluetoothMac()?.takeIf { it != DeviceIdentity.PLACEHOLDER_MAC }
+
+    /**
+     * 本机蓝牙地址门禁：未填写就拦下「启动连接」并告知用户。
+     *
+     * @return true = 地址已就绪，可以继续；false = 未填写，已提示并中止本次启动。
+     */
+    private fun requireBluetoothMac(): Boolean {
+        // 输入框里填了合法地址但忘了点「保存」：这里顺手落盘，
+        // 免得出现「我明明填了，还提示我没填」这种最让人恼火的交互
+        val typed = DeviceIdentity.normalize(macInput.text.toString())
+        if (typed != null && DeviceIdentity.overrideBluetoothMac(this) != typed) {
+            DeviceIdentity.setOverride(this, typed)
+            log("MAC: 已自动保存输入框中的本机蓝牙地址 $typed")
+        }
+        val mac = effectiveBluetoothMac()
+        refreshMacGate()
+        if (mac != null) return true
+
+        snack(TIP_MAC_MISSING, 3_600L)
+        log("MAC: 本机蓝牙地址未填写——已拦截本次「启动连接」")
+        // 焦点落到输入框并滚到可视区，用户下一步该做什么一眼可见
+        macInput.requestFocus()
+        macInput.post {
+            macInput.requestRectangleOnScreen(
+                android.graphics.Rect(0, 0, macInput.width, macInput.height),
+                true,
+            )
+        }
+        return false
+    }
+
+    /**
+     * 刷新门禁相关的界面：输入框下方提示行 + （IDLE 时）英雄卡副标题与按钮置灰。
+     *
+     * 「置灰但仍可点」是刻意的：完全 `isEnabled=false` 的话，用户点下去没有任何
+     * 反馈，只会以为 App 卡了；保持可点、点击即给出「未填写」提示才是有效引导。
+     */
+    private fun refreshMacGate() {
+        if (!::macInput.isInitialized || !::ctaButton.isInitialized) return
+        val mac = effectiveBluetoothMac()
+        if (::tvMacHint.isInitialized) {
+            tvMacHint.visibility = View.VISIBLE
+            if (mac == null) {
+                tvMacHint.setTextColor(getColor(R.color.m3_error))
+                tvMacHint.text = "未填写 —— 不填写本机蓝牙地址将无法启动连接"
+            } else {
+                tvMacHint.setTextColor(getColor(R.color.m3_mono_dim))
+                tvMacHint.text = if (DeviceIdentity.hasOverride(this)) "已保存（手填）：$mac" else "自动解析：$mac"
+            }
+        }
+        if (heroState == HeroState.IDLE) {
+            ctaButton.alpha = if (mac == null) CTA_BLOCKED_ALPHA else 1f
+            if (pendingResidualDisplays == null) {
+                heroSubline.text = if (mac == null) HINT_MAC_MISSING else HINT_IDLE_READY
+            }
+        }
     }
 
     /** 「启动连接」主体（权限检查留在这里；会话启动交给 [SessionController]，幂等不双开）。 */
@@ -406,6 +497,7 @@ class MainActivity : AppCompatActivity() {
         readyCount = findViewById(R.id.readyCount)
         ssidInput = findViewById(R.id.ssidInput)
         macInput = findViewById(R.id.macInput)
+        tvMacHint = findViewById(R.id.tvMacHint)
         btDesc = findViewById(R.id.btDesc)
         btBadge = findViewById(R.id.btBadge)
         btnPickTarget = findViewById(R.id.btnPickTarget)
@@ -617,6 +709,8 @@ class MainActivity : AppCompatActivity() {
                     log("MAC: 本机蓝牙地址已设为 $resolved（0x4300/SETUP/ctrl 广播都用它）")
                 }
             }
+            // 保存/清除都直接影响「启动连接」门禁，立刻同步提示行与按钮状态
+            refreshMacGate()
         }
 
         // 「画质增强」（写 CarLife 官方调试配置）入口已按用户要求从首页移除：
@@ -739,6 +833,8 @@ class MainActivity : AppCompatActivity() {
             val from = if (DeviceIdentity.hasOverride(this)) "手填" else "自动解析"
             log("MAC: 本机蓝牙地址=$identityMac（$from）")
         }
+        // 启动即按上面的解析结果刷新门禁（副标题/按钮置灰/输入框提示行）
+        refreshMacGate()
     }
 
     private fun bindExpandable(
@@ -874,13 +970,21 @@ class MainActivity : AppCompatActivity() {
         when (s) {
             HeroState.IDLE -> {
                 val pending = pendingResidualDisplays
+                // 门禁：本机蓝牙地址未填写 → 副标题直接说明卡在哪，按钮同时置灰
+                val macMissing = effectiveBluetoothMac() == null
                 heroSubline.text =
-                    if (pending != null) {
-                        "上次会话异常退出，遗留 ${pending.size} 个虚拟屏待清理"
-                    } else {
-                        "与车机蓝牙完成配对后，点击下方按钮发起无线连接"
+                    when {
+                        pending != null -> "上次会话异常退出，遗留 ${pending.size} 个虚拟屏待清理"
+                        macMissing -> HINT_MAC_MISSING
+                        else -> HINT_IDLE_READY
                     }
-                styleCta(R.drawable.bg_cta_fill, R.color.m3_on_primary, R.drawable.ic_play, "启动连接")
+                styleCta(
+                    R.drawable.bg_cta_fill,
+                    R.color.m3_on_primary,
+                    R.drawable.ic_play,
+                    "启动连接",
+                    blocked = macMissing,
+                )
                 audioTag.visibility = View.GONE
             }
             HeroState.CONNECTING -> {
@@ -897,12 +1001,18 @@ class MainActivity : AppCompatActivity() {
         ctaIcon.rotation = 0f
     }
 
-    /** 英雄卡主操作按钮统一样式（三个状态仅风格/图标/文案不同）。 */
+    /**
+     * 英雄卡主操作按钮统一样式（三个状态仅风格/图标/文案不同）。
+     *
+     * @param blocked 置灰但不禁用——门禁未通过时仍可点击，点上会立刻说明原因
+     *   （禁用态点下去毫无反馈，用户只会以为界面卡死）。
+     */
     private fun styleCta(
         bgRes: Int,
         colorRes: Int,
         iconRes: Int,
         label: String,
+        blocked: Boolean = false,
     ) {
         ctaButton.setBackgroundResource(bgRes)
         ctaLabel.setTextColor(getColor(colorRes))
@@ -912,6 +1022,7 @@ class MainActivity : AppCompatActivity() {
         ctaIcon.setImageResource(iconRes)
         ctaLabel.text = label
         ctaButton.isEnabled = true
+        ctaButton.alpha = if (blocked) CTA_BLOCKED_ALPHA else 1f
     }
 
     private fun updateConnectedSubline() {
@@ -2045,6 +2156,8 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         mainHandler.post(heroTick)
+        // 从系统设置/别的界面回来：门禁提示与按钮状态重新对一次（地址可能已补填）
+        refreshMacGate()
         // 旋转/重建后尚未接受：用原截止时刻续弹（不重新等 10 秒）
         if (needsDisclaimerAtLaunch(
                 DisclaimerPrefs.acceptedVersion(this),
