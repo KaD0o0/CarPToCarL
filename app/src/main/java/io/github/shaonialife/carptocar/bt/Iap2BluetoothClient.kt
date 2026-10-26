@@ -102,6 +102,17 @@ class Iap2BluetoothClient(
     private val iap2ServiceCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     /**
+     * 最近一次 …caff 连接失败的原始原因（IOException 摘要）。
+     *
+     * 只打「连接失败」时无法区分三种完全不同的情况：
+     * `Service discovery failed`（SDP 里就没有该服务 = 车机没开无线 CarPlay 窗口）、
+     * `Connection refused`（有服务但被拒）、`read failed / timeout`（车机卡住）。
+     * 2026-10-26 雪铁龙日志就卡在这一层——只有「失败」两字，判不出是哪一种。
+     */
+    @Volatile
+    private var lastConnectError: String? = null
+
+    /**
      * SDP 闸门结论。
      *
      * 2026-10-26 实车日志（凯迪拉克 CADILLAC_7731）暴露的问题：`ACTION_UUID` 广播在部分机型
@@ -281,7 +292,15 @@ class Iap2BluetoothClient(
                 // 没有 iAP2 服务，连不上还白白被断 HFP/A2DP（设备级断开兜底更会波及
                 // 其它在线设备）——确认提供 …caff 才进入「断开+连接」流程。选定目标
                 // 的设备不过闸（用户显式指定，保持原路径与时序）。
-                val gate = if (targetProvider() == null) awaitIap2Service(device) else Iap2Service.HAS
+                val gate =
+                    if (targetProvider() == null || BtSessionGate.targetSoftFallback) {
+                        // 软回退（目标连不上、放开限制）也过闸：否则会把已配对的耳机、
+                        // 蓝牙键盘（AB Shutter3）、音箱全试一遍，既断别人的音频又拖慢
+                        // 重试节奏（2026-10-26 雪铁龙日志实测）。
+                        awaitIap2Service(device)
+                    } else {
+                        Iap2Service.HAS
+                    }
                 if (gate == Iap2Service.MISSING) {
                     if (skippedNoService.add(device.address)) {
                         log("BT-C: 跳过「$name」（SDP 明确不含 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
@@ -312,11 +331,18 @@ class Iap2BluetoothClient(
                     connected = probe
                     break
                 }
-                // 「只配对、不连接」：奥迪 MIB3 实测手机与车机处于蓝牙已连接状态
-                // （HFP/A2DP 在线）时，车机不开放无线 CarPlay 的 iAP2 服务窗口——
-                // 表现为每 3s 连接失败。iAP2 是独立的 SDP 直连服务，与这些配置文件
-                // 无关，断开后不影响 CarPlay 本身（声音走 WiFi 的 AirPlay）。
-                run {
+                // 先「保持现有配置文件」直连一次。
+                // 2026-10-26 雪铁龙 R4 日志：手机 HFP/A2DP 在线时先被我们主动断开，
+                // 紧接着 …caff 连接在 **180ms** 内就失败——这么快不是超时，是 SDP 里
+                // 压根查不到该服务。顺序反过来（先试、失败再断）对两种机型都成立：
+                // 需要「保持连接」的车机第一次就能成，奥迪那类需要「仅配对」的车机
+                // 会在第一次失败后走到下面的断开重试。
+                var socket = tryConnect(device)
+                if (socket == null) {
+                    // 「只配对、不连接」：奥迪 MIB3 实测手机与车机处于蓝牙已连接状态
+                    // （HFP/A2DP 在线）时，车机不开放无线 CarPlay 的 iAP2 服务窗口——
+                    // 表现为每 3s 连接失败。iAP2 是独立的 SDP 直连服务，与这些配置文件
+                    // 无关，断开后不影响 CarPlay 本身（声音走 WiFi 的 AirPlay）。
                     val dropped = BtProfiles.disconnect(context, device)
                     if (dropped.isNotEmpty()) {
                         val now = android.os.SystemClock.uptimeMillis()
@@ -324,14 +350,13 @@ class Iap2BluetoothClient(
                             lastProfileLogAt = now
                             val left = BtProfiles.stillConnected(context, device.address)
                             log(
-                                "BT-C: $name 处于蓝牙已连接状态（${dropped.joinToString("/")}）——已断开" +
+                                "BT-C: $name 处于蓝牙已连接状态（${dropped.joinToString("/")}）——已断开重试" +
                                     if (left.isEmpty()) "" else "（仍有 ${left.joinToString("/")} 在线）",
                             )
-                            log("BT-C: 车机在「蓝牙已连接」状态下不接受 CarPlay——保持仅配对")
                         }
                     }
+                    socket = tryConnect(device)
                 }
-                val socket = tryConnect(device)
                 if (socket != null) {
                     log("BT-C: ✓ 已连入 $name 的无线 iAP2 服务（RFCOMM 建立）")
                     connected = socket
@@ -340,7 +365,18 @@ class Iap2BluetoothClient(
                     val now = android.os.SystemClock.uptimeMillis()
                     if (now - lastFailureLogAt > FAILURE_LOG_THROTTLE_MILLIS) {
                         lastFailureLogAt = now
-                        log("BT-C: 连接 $name 失败（车机未就绪或不在无线配对窗口），3 秒后重试…")
+                        val reason = lastConnectError ?: "原因未知"
+                        // 「SDP 里查不到 …caff」与「连得上但被拒」是两种完全不同的故障，
+                        // 前者意味着车机没开无线 CarPlay（有些车型根本只有有线 CarPlay）。
+                        val hint =
+                            if (reason.contains("discovery", ignoreCase = true) ||
+                                reason.contains("service", ignoreCase = true)
+                            ) {
+                                "——车机 SDP 里没有无线 CarPlay 的 iAP2 服务（未开无线 CarPlay / 该车型仅支持有线）"
+                            } else {
+                                "——车机未就绪或不在无线配对窗口，3 秒后重试…"
+                            }
+                        log("BT-C: 连接 $name 失败（$reason）$hint")
                     }
                 }
             }
@@ -424,6 +460,9 @@ class Iap2BluetoothClient(
             try {
                 device.createRfcommSocketToServiceRecord(ACCESSORY_IAP2_UUID)
             } catch (error: IOException) {
+                // 这一步抛异常 = SDP 里连 …caff 记录都没有（车机没开无线 CarPlay 窗口），
+                // 与「连上了但被拒」是两回事，必须分别记下来。
+                lastConnectError = "建立 socket 失败：${error.message ?: error.javaClass.simpleName}"
                 return null
             }
         // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
@@ -431,8 +470,10 @@ class Iap2BluetoothClient(
         currentSocket.set(socket)
         return try {
             socket.connect()
+            lastConnectError = null
             socket
         } catch (error: IOException) {
+            lastConnectError = error.message ?: error.javaClass.simpleName
             currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
             null
