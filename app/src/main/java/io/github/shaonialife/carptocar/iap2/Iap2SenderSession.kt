@@ -145,6 +145,35 @@ class Iap2SenderSession(
     /** 车机是否声明能收某消息；null = 未提供清单（未知，按保守策略继续）。 */
     private fun accessoryDeclaresReceive(messageId: Int): Boolean? = if (!receiveListDeclared) null else messageId in accessoryReceiveIds
 
+    /** 「按声明裁剪」日志去重：同一消息 ID 每轮会话只记一次（催问会反复触发）。 */
+    private val skippedByDeclaration = HashSet<Int>()
+
+    /**
+     * 可选消息的发送闸门：车机在 0x1D01 的可收清单里**明确没列**这条，就不发。
+     *
+     * 依据（2026-10-26 反编译对照，`docs/cadillac-ct5-carplay-apk-analysis.md` §2.2）：
+     * 同侧参考实现 CarWith-CarPlay 的 `WirelessBootstrap.publish()` 会按车机
+     * 0x1D00 的收发清单打印 `skip=0x4E0E reason=accessory-did-not-advertise` 并真的不发。
+     * 凯迪拉克 CADILLAC_7731（Cinemo 栈）的可收清单是
+     * `0x6801 0x4c01 0x4c04 0x5001 0x4e09 0x4e0a 0x4e0b 0x4e0c 0x4300`——
+     * **`0x4E0D`（无线可用）+ `0x4E0E`（传输标识）都不在里面**，而我们每轮问候和
+     * 每次催问都在喂它们。喂了它没说要的帧，正是「只 ACK 不推进」的一个可疑原因。
+     *
+     * 清单未提供（[receiveListDeclared] = false）时一律放行：老车机/测试台不声明清单，
+     * 保持原有行为不变，避免把「未知」当成「不能收」。
+     */
+    private fun accessoryCanReceive(messageId: Int): Boolean {
+        if (accessoryDeclaresReceive(messageId) != false) return true
+        if (skippedByDeclaration.add(messageId)) {
+            log(
+                "iap2 跳过 0x${messageId.toString(16).padStart(4, '0')} " +
+                    "(${Iap2MessageIds.nameOf(messageId)}) reason=accessory-did-not-advertise" +
+                    "（车机可收清单里没有这条，不再发送）",
+            )
+        }
+        return false
+    }
+
     private companion object {
         /** 等 StartHID 的窗口：xcertplay 会发（订阅后立即到），DiPlay 不发。 */
         const val HID_WAIT_NANOS = 2_000_000_000L
@@ -413,11 +442,19 @@ class Iap2SenderSession(
         // 真机顺序：0x4301 之后回 0x4E0E（传输标识确认）。
         // Audi 实测：车机对该消息**接受但从不 ACK**（其余包毫秒级 ACK）——必须发后不管，
         // 否则重传看门狗在 +20s 把整条蓝牙链路杀掉（EA 会话/触摸载体随之丢失）。
-        sendFireAndForget(
-            Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
-            Iap2Csm.string(0, bluetoothMac),
+        // 按车机可收清单裁剪（凯迪拉克 Cinemo 不声明 0x4E0E）。
+        val transportNotified = accessoryCanReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
+        if (transportNotified) {
+            sendFireAndForget(
+                Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+                Iap2Csm.string(0, bluetoothMac),
+            )
+        }
+        log(
+            "iap2 " +
+                (if (transportNotified) "0x4e0e/0x4300" else "0x4300（0x4e0e 按声明裁剪）") +
+                " —— Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点",
         )
-        log("iap2 0x4e0d/0x4e0e/0x4300 —— Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点")
 
         // 后续（Phase 2）：加入热点 → mDNS 解析 _airplay._tcp → AirPlay 主会话。
         // 0x5703 缺席时 AP 信息来自 0x4301（已并入 endpoint）——保活期车机重发
@@ -504,9 +541,17 @@ class Iap2SenderSession(
     private fun sendDeviceStateGreetings(force: Boolean = false) {
         if (greetingsSent && !force) return
         greetingsSent = true
-        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+        val sent = ArrayList<Int>(5)
+        // 0x4E0D（无线可用）与 0x4E0C（设备 UUID）按车机声明裁剪——它们不是流程必需，
+        // 而部分车机（凯迪拉克 Cinemo）的可收清单里根本没有 0x4E0D。
+        if (accessoryCanReceive(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)) {
+            send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+            sent += Iap2MessageIds.WIRELESS_CARPLAY_UPDATE
+        }
         send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
+        sent += Iap2MessageIds.DEVICE_LANGUAGE_UPDATE
         send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
+        sent += Iap2MessageIds.DEVICE_INFORMATION_UPDATE
         val epochSeconds = System.currentTimeMillis() / 1000L
         val timezoneMinutes =
             java.util.TimeZone
@@ -518,12 +563,19 @@ class Iap2SenderSession(
                 Iap2Csm.u16(1, timezoneMinutes and 0xFFFF) +
                 Iap2Csm.u8(2, 0),
         )
-        send(
-            Iap2MessageIds.DEVICE_UUID_UPDATE,
-            Iap2Csm.string(0, deviceUuid()),
-        )
+        sent += Iap2MessageIds.DEVICE_TIME_UPDATE
+        if (accessoryCanReceive(Iap2MessageIds.DEVICE_UUID_UPDATE)) {
+            send(
+                Iap2MessageIds.DEVICE_UUID_UPDATE,
+                Iap2Csm.string(0, deviceUuid()),
+            )
+            sent += Iap2MessageIds.DEVICE_UUID_UPDATE
+        }
         val tag = if (force) "（补发）" else ""
-        log("iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候$tag（name=$deviceName mac=$bluetoothMac）")
+        log(
+            "iap2 tx=" + sent.joinToString("/") { "0x%04x".format(it) } +
+                " 设备状态问候$tag（name=$deviceName mac=$bluetoothMac）",
+        )
     }
 
     /**
@@ -547,17 +599,23 @@ class Iap2SenderSession(
         // 车机不推进时重发问候，而不是干等），再告诉它传输方式，最后重新询问可用性。
         sendDeviceStateGreetings(force = true)
         // 0x4E0E：告诉车机「这条 iAP2 会话的传输是蓝牙」，再问一次能不能开始 CarPlay。
-        sendFireAndForget(
-            Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
-            Iap2Csm.string(0, bluetoothMac),
-        )
+        // 0x4E0E 按车机声明裁剪：凯迪拉克 Cinemo 的可收清单里没有它——反复喂它没声明
+        // 要的帧，正是「只 ACK 不推进」的可疑原因之一（见 accessoryCanReceive 的注释）。
+        // **0x4300 不裁**：它是驱动 0x4301 的请求本身，宁可多发一次也不能不发；
+        // 参考实现（CarWith-CarPlay）的 ct5FilterOptional 也只过滤通知类消息。
+        if (accessoryCanReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)) {
+            sendFireAndForget(
+                Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+                Iap2Csm.string(0, bluetoothMac),
+            )
+        }
         sendFireAndForget(
             Iap2MessageIds.CARPLAY_AVAILABILITY,
             Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
         )
         // 第 1 次必记（确认机制真的跑了），之后每 4 次记一条，避免刷屏。
         if (nudgeCount == 1 || nudgeCount % 4 == 0) {
-            log("iap2 催问第 $nudgeCount 次：重发 0x4e0e + 0x4300（车机仍未下发 0x4301，链路正常保活中）")
+            log("iap2 催问第 $nudgeCount 次：重发问候 + 0x4e0e + 0x4300（按车机声明裁剪后发送）——车机仍未下发 0x4301，链路正常保活中")
         }
     }
 

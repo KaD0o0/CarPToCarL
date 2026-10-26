@@ -248,7 +248,11 @@ class Iap2SenderSessionTest {
 
             // 设备状态问候**紧跟 0xAA05**（2026-10-26 起；上游 PR #17 的结论：
             // 车机据这批消息判定发送端已就绪，晚发会被当成还没起来）。
-            expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
+            // 凯迪拉克形态（newProtocol）的可收清单里没有 0x4E0D——发送端必须按声明裁剪，
+            // 因此这里不能等它；其余形态（不声明清单 = 未知）照旧全量发送。
+            if (!newProtocol) {
+                expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
+            }
             expect(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE)
             expect(Iap2MessageIds.DEVICE_INFORMATION_UPDATE)
             expect(Iap2MessageIds.DEVICE_TIME_UPDATE)
@@ -293,11 +297,40 @@ class Iap2SenderSessionTest {
                 sendStartSession()
             }
 
-            expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
-            if (lateStartSession) {
-                // 车机打开 CarPlay 窗口后补发（Phase 1 早已结束）
-                Thread.sleep(150)
+            if (newProtocol) {
+                // 0x4E0E（传输标识）不在凯迪拉克的可收清单里——发送端必须整条跳过，
+                // 所以这里再也不能靠「收到 0x4E0E」当 Phase 1 结束的信号。
+                // 改成静默窗口：盯够 8.6 秒（> 新协议 0x4301 的 8s 等待窗），
+                // 期间若有「车机声明不能收」的消息出现就判失败；窗口过后再补发 0x4301，
+                // 这样才真正落在「Phase 1 已结束、晚到补发」的时序上。
+                assertNoForbiddenMessages(8_600)
                 sendStartSession()
+            } else {
+                expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
+                if (lateStartSession) {
+                    // 车机打开 CarPlay 窗口后补发（Phase 1 早已结束）
+                    Thread.sleep(150)
+                    sendStartSession()
+                }
+            }
+        }
+
+        /**
+         * 断言一段时间内没有出现「车机声明不能收」的消息。
+         *
+         * 当前唯一来源是凯迪拉克 CT5（GM/Cinemo）的可收清单
+         * `0x6801 0x4c01 0x4c04 0x5001 0x4e09 0x4e0a 0x4e0b 0x4e0c 0x4300`——
+         * 其中没有 0x4E0D（无线可用）与 0x4E0E（传输标识）。
+         */
+        private fun assertNoForbiddenMessages(windowMillis: Long) {
+            val deadlineAt = System.nanoTime() + windowMillis * 1_000_000L
+            while (true) {
+                val remaining = (deadlineAt - System.nanoTime()) / 1_000_000L
+                if (remaining <= 0) return
+                val frame = recvFrame(remaining) ?: continue
+                check(frame.messageId !in FORBIDDEN_FOR_CADILLAC) {
+                    "发送端发了车机没声明能收的 0x${frame.messageId.toString(16)}（按声明裁剪失效）"
+                }
             }
         }
 
@@ -374,6 +407,11 @@ class Iap2SenderSessionTest {
                     println("MOCK got 0x${frame.messageId.toString(16)}")
                     return
                 }
+                if (newProtocol && frame.messageId in FORBIDDEN_FOR_CADILLAC) {
+                    error(
+                        "发送端发了车机没声明能收的 0x${frame.messageId.toString(16)}——按声明裁剪失效",
+                    )
+                }
                 skipped++
                 println("MOCK skip 0x${frame.messageId.toString(16)}（在等 0x${messageId.toString(16)}）")
                 check(skipped <= 64) {
@@ -393,6 +431,15 @@ class Iap2SenderSessionTest {
             if (frames.isEmpty()) return null
             frames.forEachIndexed { index, frame -> if (index > 0) pending += frame }
             return frames.first()
+        }
+
+        private companion object {
+            /** 凯迪拉克 CT5 可收清单里缺的两条（见 [assertNoForbiddenMessages]）。 */
+            val FORBIDDEN_FOR_CADILLAC =
+                setOf(
+                    Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
+                    Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+                )
         }
     }
 }

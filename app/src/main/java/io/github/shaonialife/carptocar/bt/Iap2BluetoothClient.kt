@@ -62,6 +62,18 @@ class Iap2BluetoothClient(
 
         /** SDP 探测重试次数：首次常撞上 cancelDiscovery 收尾，广播会晚于超时才到。 */
         private const val SDP_PROBE_ATTEMPTS = 2
+
+        /**
+         * 连续多少轮「主动方向在 SDP 层就失败」后切被动等车机连入。
+         * 3 轮 × 3s ≈ 9 秒——够试两三次「先直连、再断配置文件重试」，又不至于让用户干等。
+         */
+        private const val PASSIVE_FALLBACK_ROUNDS = 3
+
+        /** 被动等待窗口（对照参考实现的 60s/120s 等待窗，取短的一档）。 */
+        private const val PASSIVE_WAIT_MILLIS = 60_000L
+
+        /** 被动窗口内的轮询粒度：也决定 stop()/车机连入的响应延迟。 */
+        private const val PASSIVE_POLL_MILLIS = 2_000L
     }
 
     private var thread: Thread? = null
@@ -111,6 +123,18 @@ class Iap2BluetoothClient(
      */
     @Volatile
     private var lastConnectError: String? = null
+
+    /**
+     * 最近一次失败是不是**SDP 层**失败（`createRfcommSocketToServiceRecord` 直接抛，
+     * 即车机 SDP 里根本没有 …caff）。
+     *
+     * 与「连上了但被拒 / 超时」区分开：只有这一类才值得切「被动方向」——
+     * 车机既然没广播配件端服务，主动一侧再怎么重试都是空转，而由车机反向连入
+     * 本机的 …cafe 监听仍有可能成功（参考实现 CarWith-CarPlay 的
+     * `automatic direction fallback to car-initiated transport` 走的就是这一层）。
+     */
+    @Volatile
+    private var lastFailureWasSdpLookup = false
 
     /**
      * SDP 闸门结论。
@@ -262,6 +286,8 @@ class Iap2BluetoothClient(
             } ?: return
         var lastFailureLogAt = 0L
         var targetFailRounds = 0
+        /** 连续「SDP 层失败」的轮数（见 [PASSIVE_FALLBACK_ROUNDS]）。 */
+        var passiveFailRounds = 0
         while (running && generation.get() == myGeneration) {
             // 静默降噪（2026-10-10 用户实测后启用）——会话期间完全静默，不产生任何连接尝试/日志：
             //  - inboundActive：接收端正在连我们（两条 RFCOMM 会互相踩；Audi 实测双会话混乱）
@@ -279,6 +305,9 @@ class Iap2BluetoothClient(
                 continue
             }
             var connected: BluetoothSocket? = null
+            // 本轮有几台设备是「SDP 层就没连上」（不是被拒、不是超时）。累计到
+            // [PASSIVE_FALLBACK_ROUNDS] 轮就切被动方向（车机主动连入）。
+            var sdpLookupFailures = 0
             for (device in candidates) {
                 if (!running || generation.get() != myGeneration) return
                 val name =
@@ -322,6 +351,9 @@ class Iap2BluetoothClient(
                     }
                     if (probe == null) {
                         iap2ServiceCache[device.address] = false
+                        if (lastFailureWasSdpLookup && !looksLikePersonalAudio(device)) {
+                            sdpLookupFailures++
+                        }
                         if (skippedNoService.add(device.address)) {
                             log("BT-C: 跳过「$name」（SDP 未给出结论、直连 …caff 也失败——按非 CarPlay 设备处理）")
                         }
@@ -362,6 +394,7 @@ class Iap2BluetoothClient(
                     connected = socket
                     break
                 } else {
+                    if (lastFailureWasSdpLookup) sdpLookupFailures++
                     val now = android.os.SystemClock.uptimeMillis()
                     if (now - lastFailureLogAt > FAILURE_LOG_THROTTLE_MILLIS) {
                         lastFailureLogAt = now
@@ -393,6 +426,18 @@ class Iap2BluetoothClient(
                         )
                     }
                 }
+                // 方向兜底：连续多轮「SDP 里根本没有 …caff」时，主动一侧已无意义
+                // （雪铁龙 R4 的 180ms 失败即属此类），切被动等车机连入一段时间。
+                if (sdpLookupFailures > 0) {
+                    passiveFailRounds++
+                    if (passiveFailRounds >= PASSIVE_FALLBACK_ROUNDS) {
+                        passiveFailRounds = 0
+                        awaitCarInitiated(myGeneration)
+                        continue
+                    }
+                } else {
+                    passiveFailRounds = 0
+                }
                 sleepQuietly(RETRY_DELAY_MILLIS)
                 continue
             }
@@ -405,6 +450,43 @@ class Iap2BluetoothClient(
             sleepQuietly(RETRY_DELAY_MILLIS)
         }
         log("BT-C: 客户端已停止")
+    }
+
+    /**
+     * 被动方向兜底窗口：主动连 …caff 连续多轮在 SDP 层失败时，**停掉主动探测**，
+     * 给车机一个「反过来连我们」的干净窗口（本机的 …cafe 监听由
+     * [Iap2BluetoothServer] 一直开着，这里只负责让出通道并给出可读日志）。
+     *
+     * 依据（2026-10-26 反编译对照，`docs/cadillac-ct5-carplay-apk-analysis.md` §2.1）：
+     * 同侧参考实现 CarWith-CarPlay 在主动建连失败（且非认证类失败）时会打印
+     * `automatic direction fallback to car-initiated transport`，注册本机
+     * `…cafe` 监听 + 固定通道 29 后**等车机连进来**（等待窗 60s/120s）。
+     * 我们的监听一直存在，缺的正是「让出通道 + 明确等待」这一步：
+     * 旧实现每 3 秒重新 createRfcomm 一次，既不成功也刷日志，还可能与车机的
+     * 反向建连抢同一时刻的空口（未验证，保留为假设）。
+     *
+     * 窗口内一旦车机连入（`BtSessionGate.inboundActive`）或会话已建立就立刻返回，
+     * 由主循环接管；超时则回主动方向再来一轮，并给出「该车型可能仅支持有线」的结论性提示。
+     */
+    private fun awaitCarInitiated(myGeneration: Long) {
+        log(
+            "BT-C: 主动连 …caff 连续 $PASSIVE_FALLBACK_ROUNDS 轮在 SDP 层就失败（车机没广播配件端服务）" +
+                "——切换为等车机主动连入，最长 ${PASSIVE_WAIT_MILLIS / 1000} 秒（本机 …cafe 监听仍在运行）",
+        )
+        val deadline = android.os.SystemClock.uptimeMillis() + PASSIVE_WAIT_MILLIS
+        while (running && generation.get() == myGeneration) {
+            if (BtSessionGate.inboundActive || BtSessionGate.sessionActive) {
+                log("BT-C: 被动窗口内车机主动连入——不再探测 …caff")
+                return
+            }
+            if (android.os.SystemClock.uptimeMillis() >= deadline) break
+            sleepQuietly(PASSIVE_POLL_MILLIS)
+        }
+        if (!running || generation.get() != myGeneration) return
+        log(
+            "BT-C: 被动窗口 ${PASSIVE_WAIT_MILLIS / 1000} 秒内车机没有连入——回到主动方向重试；" +
+                "若长期如此，请确认车机是否启用无线 CarPlay（仅支持有线的车型不会有任何无线 iAP2 服务）",
+        )
     }
 
     /**
@@ -463,6 +545,7 @@ class Iap2BluetoothClient(
                 // 这一步抛异常 = SDP 里连 …caff 记录都没有（车机没开无线 CarPlay 窗口），
                 // 与「连上了但被拒」是两回事，必须分别记下来。
                 lastConnectError = "建立 socket 失败：${error.message ?: error.javaClass.simpleName}"
+                lastFailureWasSdpLookup = true
                 return null
             }
         // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
@@ -471,9 +554,11 @@ class Iap2BluetoothClient(
         return try {
             socket.connect()
             lastConnectError = null
+            lastFailureWasSdpLookup = false
             socket
         } catch (error: IOException) {
             lastConnectError = error.message ?: error.javaClass.simpleName
+            lastFailureWasSdpLookup = false
             currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
             null
