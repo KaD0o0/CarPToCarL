@@ -35,6 +35,20 @@ internal class CarLifeAudioSink(
     private var lastDropReportAt = 0L
 
     /**
+     * 电平统计（跟着 5 秒那条「音频直通」日志一起报）。
+     *
+     * 为什么需要（2026-10-26）：接过微信电话后，RTP 照发、车机 `/feedback` 的 sampleTime
+     * 按 1.00 倍实时推进（= 它在正常消费），但喇叭全静音。这时只有两种可能：
+     * ① 引擎推的就是静音（通话把媒体音频路由带走了）；② 引擎推的是真声音、车机静音位。
+     * 看 ppm 峰值/非零占比就能一眼区分，不必再猜。
+     */
+    private var peakSinceReport = 0
+
+    private var nonZeroSinceReport = 0L
+
+    private var sampledSinceReport = 0L
+
+    /**
      * 播放状态联动（车机按暂停 → 手机音乐 App PAUSED → 这里截断）。
      *
      * 根因（2026-10-24 实测）：音乐 App 收到暂停后，CarLife 引擎（`com.baidu.carlife.honor`）
@@ -130,9 +144,26 @@ internal class CarLifeAudioSink(
         if (sender == null || !sender.isRunning) return
         // 直通：交给 AudioSender 重采样 + 封包 + 发送
         sender.feedPcm(pcm, size, srcRate, srcChannels)
+        sampleLevel(pcm, size)
         packets++
         bytes += size
         reportIfDue()
+    }
+
+    /** 抽样统计电平（每 16 个采样点取 1 个，开销可忽略）。 */
+    private fun sampleLevel(
+        pcm: ByteArray,
+        size: Int,
+    ) {
+        var index = 0
+        while (index + 1 < size) {
+            val sample = (((pcm[index].toInt() and 0xFF) or (pcm[index + 1].toInt() shl 8)).toShort()).toInt()
+            val magnitude = if (sample < 0) -sample else sample
+            if (magnitude > peakSinceReport) peakSinceReport = magnitude
+            if (magnitude >= SILENCE_FLOOR) nonZeroSinceReport++
+            sampledSinceReport++
+            index += 32
+        }
     }
 
     @Synchronized
@@ -146,6 +177,9 @@ internal class CarLifeAudioSink(
         lastDropReportAt = 0
         pauseWindowExpiredLogged = false
         pausedSince = 0L
+        peakSinceReport = 0
+        nonZeroSinceReport = 0
+        sampledSinceReport = 0
     }
 
     /**
@@ -178,12 +212,18 @@ internal class CarLifeAudioSink(
         if (now - lastReportAt < REPORT_INTERVAL_MS) return
         val seconds = (now - lastReportAt) / 1000.0
         val kbps = if (seconds > 0) (bytes * 8 / 1000.0 / seconds).toInt() else 0
+        val peakPercent = peakSinceReport * 100 / 32768
+        val nonZeroPercent = if (sampledSinceReport > 0) (nonZeroSinceReport * 100 / sampledSinceReport).toInt() else 0
         log(
-            "CARLIFE: 音频直通 ${packets} 包 / ${bytes / 1024}KB / ${kbps}kbps",
+            "CARLIFE: 音频直通 ${packets} 包 / ${bytes / 1024}KB / ${kbps}kbps" +
+                " · 电平 ${peakPercent}%（非零 ${nonZeroPercent}%）",
         )
         lastReportAt = now
         packets = 0
         bytes = 0
+        peakSinceReport = 0
+        nonZeroSinceReport = 0
+        sampledSinceReport = 0
     }
 
     private companion object {
@@ -202,6 +242,9 @@ internal class CarLifeAudioSink(
          * 又不会因为「手机里常驻一条暂停的音乐会话」把导航播报/提示音长期吃掉。
          */
         const val PAUSE_DROP_WINDOW_MS = 15_000L
+
+        /** 电平统计的「非零」门限（约 -66dBFS，低于它的样本算静音底噪）。 */
+        const val SILENCE_FLOOR = 16
     }
 }
 

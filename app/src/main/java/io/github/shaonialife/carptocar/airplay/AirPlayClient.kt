@@ -51,6 +51,10 @@ class AirPlayClient(
      */
     private val retryTick: ((attempt: Int) -> Unit)? = null,
 ) {
+
+    /** 音频 SETUP 时用的车机地址（会话中途要重新核对音量时复用）。 */
+    @Volatile
+    private var lastAudioHost: String? = null
     /**
      * 当前使用的接收端端点。0x4301 晚到 / mDNS 后上线时由主控热更新；
      * 配对循环每轮重试都重新读取，改动在下一轮即生效。
@@ -1700,6 +1704,7 @@ class AirPlayClient(
                 ),
             )
         val host = endpoint.ipAddresses.firstOrNull() ?: "receiver"
+        lastAudioHost = host
         val startedAt = SystemClock.uptimeMillis()
         val (statusLine, responseBody) =
             try {
@@ -1785,6 +1790,21 @@ class AirPlayClient(
      * ② 若确实处于静音位（≤[MUTE_THRESHOLD_DB]），抬到 [SAFE_VOLUME_DB]。
      * 查询失败/车机不支持都不影响主链路。
      */
+    /**
+     * 会话中途重新核对并纠正车机音量（**幂等**，可随时调）。
+     *
+     * 用途（2026-10-26 真机）：接过一次微信电话后，车机侧数据照收、音频时钟按实时推进，
+     * 但喇叭全静音——正是「接收端音量被通话接管后停在静音位」的典型表现。通话结束时
+     * 由主控重新调一次这里，把它抬回可用档位。
+     *
+     * 阻塞（RTSP 往返，最长 4s×2），请从后台线程调用。
+     */
+    fun refreshVolume(reason: String) {
+        val host = lastAudioHost ?: endpoint.ipAddresses.firstOrNull() ?: return
+        log("AIRPLAY: $reason → 重新核对车机音量（$host）")
+        runCatching { probeAndFixVolume(host) }
+    }
+
     private fun probeAndFixVolume(host: String) {
         val url = "rtsp://$host:${endpoint.airPlayPort}/"
         val volume: Float? =

@@ -378,9 +378,11 @@ object SessionController {
 
     @Volatile
     var audioSender: AudioSender? = null
-
     @Volatile
     var currentClient: AirPlayClient? = null
+
+    /** 通话状态看门狗线程（音频会话期间每秒看一次 AudioManager.mode）。 */
+    private var callWatcher: Thread? = null
 
     @Volatile
     var currentHiddenSource: HiddenDisplaySource? = null
@@ -422,6 +424,13 @@ object SessionController {
      * 与首个欠载周期的余量。
      */
     private const val AUDIO_PROFILE_PROBE_MS = 20_000L
+
+    /**
+     * 通话结束后多久重建音频流（ms）。
+     * 车机从「通话」切回「媒体」自身有 1~3 秒的资源仲裁过渡，立刻重建会和它抢音频通路，
+     * 取 2.5 秒让车机先把通话通路收干净。
+     */
+    private const val AUDIO_REBUILD_DELAY_MS = 2_500L
 
     /** 会话建立互斥（端点交接 → 配对 → 推流全程只允许一条）。 */
     val sessionStarting = AtomicBoolean(false)
@@ -1352,6 +1361,7 @@ object SessionController {
                 activeAudioStartedAt = 0L
                 false
             } else {
+                startCallWatcher(sender)
                 true
             }
         } catch (error: Exception) {
@@ -1362,6 +1372,158 @@ object SessionController {
             false
         }
     }
+
+    /**
+     * 通话结束后**重建整条音频流**（新的 streamConnectionID / 新端口 / 新编码器）。
+     *
+     * 2026-10-26 实测（1.0.5 · 奥迪 MIB3 + WinPlay 车机盒）：微信来电挂断后
+     * `/feedback` 的 `sampleTime` 仍按 **1.00 倍**实时推进（接收端在正常解码排播），
+     * 电平表同时证明推的是**真声音**（100%，非零 99%），车机却一点声都不出。
+     * 两个「接收端在消费」的证据合起来只剩一种解释：**它的音频输出设备在通话期间
+     * 被释放后没重新打开**——解码照旧、输出通路断开。
+     *
+     * 这类卡死下改音量（本机 `GET_PARAMETER volume` 返回空 body，车机不支持查询，
+     * `SET_PARAMETER` 也无效果）和补同步包都不能救，因为本机侧时钟与内容都是正常的。
+     * 唯一在 App 侧能做的、也正是「重连一次就好」在音频层的等价物：
+     * 让接收端**新建一条音频流**，逼它重新打开输出通路。
+     *
+     * 顺序刻意是「**先协商新的、成功了才停旧的**」：SETUP 被拒时旧流仍在推，
+     * 绝不能把「本来还有声」搞成「彻底没声」。
+     */
+    @Synchronized
+    fun rebuildAudioChannel(reason: String): Boolean {
+        val client = currentClient ?: return false
+        val secret = currentSharedSecret ?: return false
+        val host = currentAudioHost ?: return false
+        val profile = activeAudioProfile ?: return false
+        val context = appContext?.applicationContext ?: return false
+        val old = audioSender ?: return false
+        if (!old.isRunning) return false
+        appendLog("AUDIO: $reason → 重建音频流（接收端音频输出在通话期间被释放，需新建流才会重开）")
+        val info =
+            try {
+                client.runAudioStream(secret, profile, AudioTuning.RAW_SPF)
+            } catch (error: Exception) {
+                appendLog("AUDIO: 重建协商异常 - ${error.message}")
+                null
+            }
+        if (info == null) {
+            appendLog("AUDIO: 重建协商失败——保持原音频流继续推（不降级成无声）")
+            return false
+        }
+        // 新流已就绪：停旧发送端。旧流不再有包，接收端会在超时后自行回收。
+        old.stop()
+        audioSender = null
+        // 旧看门狗线程因 sender.isRunning=false 自行退出；置空后下一行才能重新挂载。
+        callWatcher = null
+        val sender =
+            AudioSender(
+                host = host,
+                dataPort = info.dataPort,
+                streamKey = info.streamKey,
+                log = { line -> appendLog(line) },
+                context = context,
+                sampleRate = info.sampleRate,
+                codec = profile.codec,
+                streamType = profile.streamType,
+                adtsFrames = AudioTuning.RAW_SPF.adts,
+                controlPort = info.controlPort,
+            )
+        audioSender = sender
+        if (!sender.startPassthrough()) {
+            audioSender = null
+            activeAudioStartedAt = 0L
+            appendLog("AUDIO: 音频流重建后启动失败——本次仅推视频（重连可恢复）")
+            return false
+        }
+        activeAudioStartedAt = android.os.SystemClock.uptimeMillis()
+        startCallWatcher(sender)
+        // 新流是在「会话已激活」之后加入的：按 AirPlay 语义必须补发 RECORD 纳入会话，
+        // 否则车机对 SETUP 回 200、给端口，但不排播（见 startAudioChannel 同名注释）。
+        client.record()
+        appendLog(
+            "AUDIO: 音频流重建完成（新 dataPort=${info.dataPort} " +
+                "controlPort=${info.controlPort}）——若仍无声，说明卡在车机音源选择而非本机",
+        )
+        return true
+    }
+
+    /** 延迟 2.5 秒再重建：让车机先把通话通路的资源收干净，避免两边抢音频设备。 */
+    private fun scheduleAudioRebuild() {
+        val worker =
+            Thread {
+                try {
+                    Thread.sleep(AUDIO_REBUILD_DELAY_MS)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                runCatching { rebuildAudioChannel("通话结束 ${AUDIO_REBUILD_DELAY_MS / 1000} 秒后") }
+                    .onFailure { appendLog("AUDIO: 重建异常 - ${it.message}") }
+            }
+        worker.isDaemon = true
+        worker.name = "audio-rebuild"
+        worker.start()
+    }
+
+    /**
+     * 通话状态看门狗（音频会话期间每秒看一次 `AudioManager.mode`）。
+     *
+     * 2026-10-26 真机现象：微信来电接听后声音转到手机，挂断后车机**数据照收、`/feedback`
+     * 的 sampleTime 还按 1.00 倍实时推进，就是没有声音**——说明接收端在正常消费，
+     * 问题只能是「内容静音」或「接收端增益停在静音位」。
+     *
+     * 真 iPhone 会在会话中反复下发 `SET_PARAMETER volume`，我们只在音频 SETUP 时发过一次；
+     * 车机若在通话期间把增益压到静音位，挂断后不会自己回来。所以通话结束
+     * （IN_CALL / IN_COMMUNICATION / RINGTONE → NORMAL）时补两件事：
+     * ① 重新核对并纠正车机音量；② 补一轮同步包重锚。两者都幂等，失败只记日志。
+     */
+    private fun startCallWatcher(sender: AudioSender) {
+        if (callWatcher?.isAlive == true) return
+        val manager =
+            appContext?.applicationContext?.getSystemService(Context.AUDIO_SERVICE)
+                as? android.media.AudioManager ?: return
+        callWatcher =
+            Thread {
+                var lastMode = manager.mode
+                while (sender.isRunning) {
+                    try {
+                        Thread.sleep(1_000)
+                    } catch (_: InterruptedException) {
+                        return@Thread
+                    }
+                    val mode = manager.mode
+                    if (mode == lastMode) continue
+                    appendLog("AUDIO: 音频模式 ${audioModeName(lastMode)} → ${audioModeName(mode)}")
+                    if (isCallMode(lastMode) && !isCallMode(mode)) {
+                        appendLog("AUDIO: 通话结束——重新核对车机音量并补同步包（车机常停在静音位）")
+                        currentClient?.refreshVolume("通话结束")
+                        sender.resyncAnchor("通话结束")
+                        // 音量/同步包都救不了「接收端输出设备被释放」这一种：
+                        // 再补一次「新建音频流」，才是重连一次就能好的等价动作。
+                        scheduleAudioRebuild()
+                    }
+                    lastMode = mode
+                }
+            }.apply {
+                isDaemon = true
+                name = "audio-call-watch"
+                start()
+            }
+    }
+
+    private fun isCallMode(mode: Int): Boolean =
+        mode == android.media.AudioManager.MODE_IN_CALL ||
+            mode == android.media.AudioManager.MODE_IN_COMMUNICATION ||
+            mode == android.media.AudioManager.MODE_RINGTONE
+
+    private fun audioModeName(mode: Int): String =
+        when (mode) {
+            android.media.AudioManager.MODE_NORMAL -> "NORMAL"
+            android.media.AudioManager.MODE_RINGTONE -> "RINGTONE"
+            android.media.AudioManager.MODE_IN_CALL -> "IN_CALL"
+            android.media.AudioManager.MODE_IN_COMMUNICATION -> "IN_COMMUNICATION"
+            else -> "mode=$mode"
+        }
 
     /**
      * 会话结束时的**音频拆链归因**（2026-10-19 Honda HFT / Alpine 实测新增）。

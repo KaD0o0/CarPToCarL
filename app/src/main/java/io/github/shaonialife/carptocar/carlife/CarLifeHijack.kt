@@ -246,6 +246,10 @@ object CarLifeHijack {
     @Volatile
     private var stallSince = 0L
 
+    /** 收到的帧序号（看门狗用差分量算帧率，不依赖 wall clock 对齐）。 */
+    @Volatile
+    private var frameSeq = 0L
+
     /** 车机通道是否已接上（画面正在直通）。 */
     val isAttached: Boolean get() = sender != null
 
@@ -552,6 +556,8 @@ object CarLifeHijack {
      */
     private fun startStallWatchdog() {
         Thread {
+            var previous = frameSeq
+            var lowRateSince = 0L
             while (running.get()) {
                 try {
                     Thread.sleep(STALL_POLL_MILLIS)
@@ -559,16 +565,30 @@ object CarLifeHijack {
                     return@Thread
                 }
                 if (!running.get()) return@Thread
-                if (sender == null) continue // 还没连车机，不统计
-                val last = lastSourceFrameAt
-                if (last == 0L || stallSince > 0) continue
                 val now = android.os.SystemClock.uptimeMillis()
-                val idle = now - last
-                if (idle < STALL_LOG_MILLIS) continue
-                stallSince = last
+                val current = frameSeq
+                val delta = current - previous
+                previous = current
+                if (sender == null) {
+                    lowRateSince = 0L
+                    continue
+                }
+                // 注意不能按「一帧都没有」判：来电期间引擎仍会发 0.8fps 的心跳帧，
+                // 只是没有新 IDR。这里按窗口帧数判（2 秒内少于 4 帧 ≈ 低于 2fps）。
+                if (delta >= 4) {
+                    lowRateSince = 0L
+                    continue
+                }
+                if (lowRateSince == 0L) {
+                    lowRateSince = now - STALL_POLL_MILLIS
+                    continue
+                }
+                if (stallSince > 0 || now - lowRateSince < STALL_LOG_MILLIS) continue
+                stallSince = lowRateSince
                 logSink?.invoke(
-                    "CARLIFE: 画面源停摆 ${idle / 1000} 秒——引擎这段时间几乎不出帧" +
-                        "（来电/锁屏时手机侧画面被占用，车机会黑屏；恢复后会补关键帧）",
+                    "CARLIFE: 画面源停摆 ${(now - lowRateSince) / 1000} 秒（帧率 <2fps，零个新 IDR）" +
+                        "——引擎这段时间几乎不出帧（来电/锁屏时手机侧画面被占用，车机会黑屏；" +
+                        "恢复后会补关键帧）",
                 )
             }
         }.apply {
@@ -589,6 +609,7 @@ object CarLifeHijack {
         // 停摆检测的打卡点（来电时引擎会整段不出帧，只能靠这里判断「是源没画面」还是链路断）
         val now = android.os.SystemClock.uptimeMillis()
         lastSourceFrameAt = now
+        frameSeq++
         val stalledSince = stallSince
         if (stalledSince > 0) {
             stallSince = 0
