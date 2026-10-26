@@ -20,14 +20,14 @@
 **最新正式版**（免编译，直接装）：
 
 > **[`CarPToCarL-latest.apk`](https://github.com/jjuugk/CarPToCarL/releases/latest/download/CarPToCarL-latest.apk)**
-> —— 固定直链，永远指向最新一版（当前 1.0.2，13.2 MB）
+> —— 固定直链，永远指向最新一版（当前 1.0.7，13.2 MB）
 
 | 项        | 值                                                                              |
 | -------- | ------------------------------------------------------------------------------ |
 | 全部版本     | [Releases 页面](https://github.com/jjuugk/CarPToCarL/releases)（含更新日志与历史版本）        |
-| 本版固定包    | [`CarPToCarL-1.0.2-release.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.0.2/CarPToCarL-1.0.2-release.apk) |
+| 本版固定包    | [`CarPToCarL-1.0.7-release.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.0.7/CarPToCarL-1.0.7-release.apk) |
 | 系统要求     | Android 12 及以上（minSdk 31）                                                      |
-| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 / 1.0.1，但不要与其它来源的包混装                    |
+| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 ~ 1.0.6，但不要与其它来源的包混装                    |
 | 安装       | 系统安装器直接装，或 `adb install -r CarPToCarL-latest.apk`                              |
 | 前置       | 手机需装 **CarLife+**（荣耀机型为 `com.baidu.carlife.honor`）                             |
 
