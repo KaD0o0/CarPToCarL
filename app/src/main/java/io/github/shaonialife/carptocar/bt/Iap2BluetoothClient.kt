@@ -59,6 +59,9 @@ class Iap2BluetoothClient(
 
         /** SDP 服务探测等待窗（fetchUuidsWithSdp → ACTION_UUID 广播）。 */
         private const val SDP_PROBE_TIMEOUT_MILLIS = 2_500L
+
+        /** SDP 探测重试次数：首次常撞上 cancelDiscovery 收尾，广播会晚于超时才到。 */
+        private const val SDP_PROBE_ATTEMPTS = 2
     }
 
     private var thread: Thread? = null
@@ -99,15 +102,28 @@ class Iap2BluetoothClient(
     private val iap2ServiceCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
     /**
+     * SDP 闸门结论。
+     *
+     * 2026-10-26 实车日志（凯迪拉克 CADILLAC_7731）暴露的问题：`ACTION_UUID` 广播在部分机型
+     * 上根本不来，旧实现「等不到广播 = 没有 iAP2 服务」，于是自动模式把真车机当耳机跳过
+     * ——日志里同一台车 13 秒前被判「非 CarPlay 设备」，13 秒后手动指定目标就连上了。
+     * 因此把「问不出来」与「明确没有」分开：只有 SDP 真的回了答案且不含 …caff 才算 MISSING。
+     */
+    private enum class Iap2Service { HAS, MISSING, UNKNOWN }
+
+    /**
      * 设备是否提供配件端 iAP2 服务（…caff）：先读系统 uuids 缓存，缺失再
-     * `fetchUuidsWithSdp` 触发一次 SDP 查询并等 `ACTION_UUID` 广播（超时按无服务）。
-     * 结论缓存到客户端停止——车机固件升级换 UUID 的场景由重启 App 覆盖。
+     * `fetchUuidsWithSdp` 触发 SDP 查询并等 `ACTION_UUID` 广播。
+     *
+     * **广播一次都没来 → [Iap2Service.UNKNOWN]**（不是「没有」）；只有收到广播且 uuids 里
+     * 确实没有 …caff 才是 [Iap2Service.MISSING]。结论缓存到客户端停止——车机固件升级换
+     * UUID 的场景由重启 App 覆盖。
      * 权限：start() 已校验 BLUETOOTH_CONNECT；uuids/fetchUuidsWithSdp 的
-     * SecurityException 由 runCatching 吸收（探测失败按无服务处理，不断音频）。
+     * SecurityException 由 runCatching 吸收。
      */
     @SuppressLint("MissingPermission")
-    private fun awaitIap2Service(device: BluetoothDevice): Boolean {
-        iap2ServiceCache[device.address]?.let { return it }
+    private fun awaitIap2Service(device: BluetoothDevice): Iap2Service {
+        iap2ServiceCache[device.address]?.let { return if (it) Iap2Service.HAS else Iap2Service.MISSING }
 
         fun cachedHas(): Boolean =
             runCatching {
@@ -116,41 +132,65 @@ class Iap2BluetoothClient(
 
         if (cachedHas()) {
             iap2ServiceCache[device.address] = true
-            return true
+            return Iap2Service.HAS
         }
-        val latch = java.util.concurrent.CountDownLatch(1)
-        val receiver =
-            object : android.content.BroadcastReceiver() {
-                override fun onReceive(
-                    receiverContext: Context,
-                    intent: android.content.Intent,
-                ) {
-                    @Suppress("DEPRECATION")
-                    val hit = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                    if (hit?.address == device.address) latch.countDown()
+        // 允许重试：第一次查询常撞上 cancelDiscovery 的收尾，广播会晚于超时才到。
+        repeat(SDP_PROBE_ATTEMPTS) {
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val receiver =
+                object : android.content.BroadcastReceiver() {
+                    override fun onReceive(
+                        receiverContext: Context,
+                        intent: android.content.Intent,
+                    ) {
+                        @Suppress("DEPRECATION")
+                        val hit = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                        if (hit?.address == device.address) latch.countDown()
+                    }
+                }
+            var answered = false
+            val started =
+                runCatching {
+                    ContextCompat.registerReceiver(
+                        context,
+                        receiver,
+                        android.content.IntentFilter(BluetoothDevice.ACTION_UUID),
+                        ContextCompat.RECEIVER_EXPORTED,
+                    )
+                    device.fetchUuidsWithSdp()
+                }.getOrDefault(false)
+            if (started) {
+                try {
+                    answered = latch.await(SDP_PROBE_TIMEOUT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    runCatching { context.unregisterReceiver(receiver) }
+                    return Iap2Service.UNKNOWN
                 }
             }
-        val started =
-            runCatching {
-                ContextCompat.registerReceiver(
-                    context,
-                    receiver,
-                    android.content.IntentFilter(BluetoothDevice.ACTION_UUID),
-                    ContextCompat.RECEIVER_EXPORTED,
-                )
-                device.fetchUuidsWithSdp()
-            }.getOrDefault(false)
-        if (started) {
-            try {
-                latch.await(SDP_PROBE_TIMEOUT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
+            runCatching { context.unregisterReceiver(receiver) }
+            if (answered) {
+                val has = cachedHas()
+                iap2ServiceCache[device.address] = has
+                return if (has) Iap2Service.HAS else Iap2Service.MISSING
             }
         }
-        runCatching { context.unregisterReceiver(receiver) }
-        val has = cachedHas()
-        iap2ServiceCache[device.address] = has
-        return has
+        return Iap2Service.UNKNOWN
+    }
+
+    /**
+     * 像个人音频设备（耳机/音箱/便携音响）——这类**绝不**为了探 iAP2 去断它的音频。
+     * 车机常见的是 HANDSFREE / CAR_AUDIO / UNCATEGORIZED，都不会命中。
+     */
+    @SuppressLint("MissingPermission")
+    private fun looksLikePersonalAudio(device: BluetoothDevice): Boolean {
+        val deviceClass =
+            runCatching { device.bluetoothClass?.deviceClass }.getOrNull() ?: return false
+        return deviceClass == android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_WEARABLE_HEADSET ||
+            deviceClass == android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_HEADPHONES ||
+            deviceClass == android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_LOUDSPEAKER ||
+            deviceClass == android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_PORTABLE_AUDIO ||
+            deviceClass == android.bluetooth.BluetoothClass.Device.AUDIO_VIDEO_HIFI_AUDIO
     }
 
     /** 「蓝牙已连接→已断开」日志节流时间戳。 */
@@ -241,11 +281,36 @@ class Iap2BluetoothClient(
                 // 没有 iAP2 服务，连不上还白白被断 HFP/A2DP（设备级断开兜底更会波及
                 // 其它在线设备）——确认提供 …caff 才进入「断开+连接」流程。选定目标
                 // 的设备不过闸（用户显式指定，保持原路径与时序）。
-                if (targetProvider() == null && !awaitIap2Service(device)) {
+                val gate = if (targetProvider() == null) awaitIap2Service(device) else Iap2Service.HAS
+                if (gate == Iap2Service.MISSING) {
                     if (skippedNoService.add(device.address)) {
-                        log("BT-C: 跳过「$name」（未发现 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
+                        log("BT-C: 跳过「$name」（SDP 明确不含 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
                     }
                     continue
+                }
+                if (gate == Iap2Service.UNKNOWN) {
+                    // SDP 没问出结论：先**不动音频**，直接探一次 …caff。
+                    // 探通=它就是车机（自动模式不再误杀，这是 2026-10-26 凯迪拉克日志的病根）；
+                    // 探不通再看是不是「蓝牙已连接时不开放服务窗口」的机型（奥迪实测），
+                    // 此时才断开配置文件重试一次——耳机类设备永远不会被我们断掉音频。
+                    var probe = tryConnect(device)
+                    if (probe == null && !looksLikePersonalAudio(device)) {
+                        val dropped = BtProfiles.disconnect(context, device)
+                        if (dropped.isNotEmpty()) {
+                            log("BT-C: $name SDP 未给结论、直连失败——已断开 ${dropped.joinToString("/")} 再试一次")
+                        }
+                        probe = tryConnect(device)
+                    }
+                    if (probe == null) {
+                        iap2ServiceCache[device.address] = false
+                        if (skippedNoService.add(device.address)) {
+                            log("BT-C: 跳过「$name」（SDP 未给出结论、直连 …caff 也失败——按非 CarPlay 设备处理）")
+                        }
+                        continue
+                    }
+                    log("BT-C: 「$name」SDP 未给出结论，但直连 …caff 成功——按车机处理")
+                    connected = probe
+                    break
                 }
                 // 「只配对、不连接」：奥迪 MIB3 实测手机与车机处于蓝牙已连接状态
                 // （HFP/A2DP 在线）时，车机不开放无线 CarPlay 的 iAP2 服务窗口——

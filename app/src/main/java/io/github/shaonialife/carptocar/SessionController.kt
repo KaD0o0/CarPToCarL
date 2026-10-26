@@ -1226,16 +1226,41 @@ object SessionController {
         source: String,
     ) {
         Bg.run("pending-start-session-watch") {
+            // 英雄卡副标题同步：否则界面一直显示默认的「蓝牙 iAP2 握手 → …」，
+            // 用户看到的是「一直在握手」，实际早已连上、在等车机下发凭据。
+            phaseHint = "已连上车机，正在等它下发热点信息（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· 请保持 Wi-Fi 开启"
+            appendLog(
+                ">>> [$source] 进入保活等待：车机声明会发 0x4301 但窗口内未到。" +
+                    "蓝牙链路保持（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟），" +
+                    "期间请保持手机 Wi-Fi 开启；车机多数要看到手机进入它自己的网络后才会下发凭据",
+            )
             var promptedSsid: String? = null
-            val deadline = android.os.SystemClock.uptimeMillis() + PENDING_START_SESSION_WAIT_MS
+            val watchStartedAt = android.os.SystemClock.uptimeMillis()
+            val deadline = watchStartedAt + PENDING_START_SESSION_WAIT_MS
+            var tick = 0
             while (!connectCancelled && android.os.SystemClock.uptimeMillis() < deadline) {
                 Thread.sleep(5_000)
+                tick++
                 if (connectCancelled) return@run
                 // 晚到 0x4301 已触发新一轮交接——观察任务让位。
                 if (sessionStarting.get()) return@run
-                val ssid = shellWifiStatus().second ?: continue
+                val (wifiEnabled, currentSsid) = shellWifiStatus()
+                // 每 30s 落一行：没有它，等待期在日志里只剩车机心跳，用户/排查都看不出在等什么。
+                if (tick % 6 == 0) {
+                    val waited = (android.os.SystemClock.uptimeMillis() - watchStartedAt) / 1_000
+                    appendLog(
+                        ">>> [$source] 仍在等 0x4301（已等 ${waited}s · 上限 " +
+                            "${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· Wi-Fi=" +
+                            when {
+                                !wifiEnabled -> "已关闭（请打开——车机看不到手机就不会下发凭据）"
+                                currentSsid.isNullOrEmpty() -> "已开但未连接任何网络"
+                                else -> "\"$currentSsid\""
+                            },
+                    )
+                }
+                val ssid = if (wifiEnabled) currentSsid else null
                 // 同一 SSID 只问一次（用户选「继续等待」后不再打扰）；换网络再问。
-                if (ssid.isEmpty() || promptedSsid == ssid) continue
+                if (ssid.isNullOrEmpty() || promptedSsid == ssid) continue
                 promptedSsid = ssid
                 val choice =
                     askWifiJoinChoice(
