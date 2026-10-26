@@ -106,6 +106,27 @@ class Iap2SenderSession(
     private var lastLateStartSessionSignature: Int? = null
 
     /**
+     * 是否处于「已进入保活、正等车机下发 0x4301」的等待态。
+     *
+     * 为真时保活泵改用短超时轮询，并每隔 [NUDGE_INTERVAL_MILLIS] 重发一次
+     * `0x4e0e`（传输标识）+ `0x4300`（CarPlay 可用性）「催问」车机。
+     * 依据：凯迪拉克 CADILLAC_7731（Cinemo 栈）声明了 11 条消息——含 0x4301、
+     * 0x6800、0x4c00、0x5000——却**一条都没主动发起**，只对我们的包回 ACK。
+     * 这种「只应答不发起」的形态很像在等前置消息；而 0x4E0E 此前要等 8 秒窗口
+     * 过期后才发，若车机正是等它，顺序就错了。
+     */
+    @Volatile
+    private var awaitingStartSession = false
+
+    /** 已催问次数（用于限次与日志节流）。 */
+    @Volatile
+    private var nudgeCount = 0
+
+    /** 上次催问时间戳（毫秒）。 */
+    @Volatile
+    private var lastNudgeAt = 0L
+
+    /**
      * 0x1D01 参数 6：车机声明「它可发送」的消息 ID 清单。
      * 用它判断 0x6800 (StartHID) / 0x4301 是否真的会来——声明里没有就不该盲等：
      * 奥迪实测只声明 0x5703/0xea03，旧流程因此在 0x4301 上空等 10s、StartHID 上空等 2s。
@@ -144,6 +165,15 @@ class Iap2SenderSession(
 
         /** 0x4301 原始体日志上限（Audi 实测 261B，完整记录；异常大的只截前段）。 */
         const val START_SESSION_RAW_LOG_BYTES = 1_024
+
+        /** 等待 0x4301 时保活泵的轮询间隔（也是催问的最小检查粒度）。 */
+        const val NUDGE_TICK_MILLIS = 5_000L
+
+        /** 催问间隔：太密会像洪水把车机打懵，太疏则复测一轮耗时长。 */
+        const val NUDGE_INTERVAL_MILLIS = 15_000L
+
+        /** 催问上限（20 × 15s = 5 分钟，与主控的空端点等待窗口一致）。 */
+        const val NUDGE_MAX_TIMES = 20
 
         /**
          * 已知「静默过」的档位重试窗口。首次试探保留原窗口（可能是慢车机），
@@ -347,6 +377,11 @@ class Iap2SenderSession(
                             "iap2 0x4301 窗口内未到但车机声明会发——不拆链，返回空端点进入保活；" +
                                 "晚到 0x4301 将重新触发配对（Audi MMI 9310 先例：2 分 35 秒）",
                         )
+                        // 进入「催问」模式：保活泵会周期性重发 0x4e0e + 0x4300。
+                        // 依据 2026-10-26 凯迪拉克日志——车机声明了 11 条消息（含 0x4301/0x6800/
+                        // 0x4c00/0x5000）却**一条都没主动发起**，只回 ACK，像是卡在等某个前置消息。
+                        // 0x4E0E（传输标识）此前要等 8s 窗口过期后才发，若车机正是等它，顺序就错了。
+                        awaitingStartSession = true
                         CarPlayEndpoint(
                             ssid = "",
                             passphrase = "",
@@ -421,15 +456,20 @@ class Iap2SenderSession(
      * 真实无线 CarPlay 中这条控制通道与 AirPlay 会话并存于整个连接生命周期。
      */
     fun pumpIncomingForever() {
-        log("SESSION 保活中（链路保持打开，持续记录配件消息）")
+        log(
+            "SESSION 保活中（链路保持打开，持续记录配件消息）" +
+                if (awaitingStartSession) "——车机尚未下发 0x4301，将每 ${NUDGE_INTERVAL_MILLIS / 1000}s 催问一次" else "",
+        )
         // 同一消息 ID 连续到达时限流：车机进入媒体播放后会周期性发 NowPlaying 更新，
         // 逐条打日志会把文件日志撑爆（文件超 2MB 直接删，等于丢掉真正有用的上下文）。
         var lastLoggedId = -1
         var repeatCount = 0
         while (true) {
-            val frame = recvFrame(30_000L)
+            // 等待态用短超时：`recvFrame` 阻塞期间没法催问，只能靠「空转一次就检查一次」。
+            val frame = recvFrame(if (awaitingStartSession) NUDGE_TICK_MILLIS else 30_000L)
             if (frame == null) {
                 if (!channel.isAlive) break
+                if (awaitingStartSession) nudgeIfDue()
                 continue
             }
             // 生命周期消息必须先于日志限流处理：0x4301 可能作为「车机刚打开 CarPlay
@@ -461,6 +501,38 @@ class Iap2SenderSession(
             )
         }
         log("SESSION 保活结束（链路断开）")
+    }
+
+    /**
+     * 等待 0x4301 期间的「催问」：重发 0x4e0e + 0x4300。
+     *
+     * 这是**假设验证**用的一步，不是已证实的协议要求：凯迪拉克那台车机声明了
+     * 0x4301/0x6800/0x4c00/0x5000 却一条都不主动发起，最可能的解释是它在等某条
+     * 前置消息。0x4E0E 是「我这条会话挂在蓝牙上」的显式告知，真 iPhone 在
+     * 0x4300 前后都会发；我们此前只在 8s 窗口过期后才补一条。
+     *
+     * 限次（[NUDGE_MAX_TIMES]）而非无限重发：车机若始终不理，继续喂也只会把日志刷满，
+     * 5 分钟窗口到点后由主控拆链重连。
+     */
+    private fun nudgeIfDue() {
+        val now = System.currentTimeMillis()
+        if (now - lastNudgeAt < NUDGE_INTERVAL_MILLIS) return
+        if (nudgeCount >= NUDGE_MAX_TIMES) return
+        lastNudgeAt = now
+        nudgeCount++
+        // 0x4E0E 先发：告诉车机「这条 iAP2 会话的传输是蓝牙」，再问一次能不能开始 CarPlay。
+        sendFireAndForget(
+            Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+            Iap2Csm.string(0, bluetoothMac),
+        )
+        sendFireAndForget(
+            Iap2MessageIds.CARPLAY_AVAILABILITY,
+            Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
+        )
+        // 第 1 次必记（确认机制真的跑了），之后每 4 次记一条，避免刷屏。
+        if (nudgeCount == 1 || nudgeCount % 4 == 0) {
+            log("iap2 催问第 $nudgeCount 次：重发 0x4e0e + 0x4300（车机仍未下发 0x4301，链路正常保活中）")
+        }
     }
 
     /**
@@ -572,9 +644,13 @@ class Iap2SenderSession(
             log("iap2 rx=0x4301（晚到）——无线组里没解析出 SSID，本条忽略")
             return
         }
+        // 凭据到手，不用再催了（催问频率与日志噪音都到此为止）。
+        if (awaitingStartSession) {
+            awaitingStartSession = false
+            log("iap2 催问共 ${nudgeCount} 次后收到可用 0x4301——停止催问")
+        }
         // 车机可能周期性重发同一份 0x4301：详情只在端点变化时打，避免刷日志。
-        if (endpoint.hashCode() != lastLateStartSessionSignature) {
-            lastLateStartSessionSignature = endpoint.hashCode()
+        if (endpoint.hashCode() != lastLateStartSessionSignature) {            lastLateStartSessionSignature = endpoint.hashCode()
             log(
                 "iap2 rx=0x4301（晚到，Phase 1 之后）airPlayPort=${endpoint.airPlayPort} " +
                     "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKey?.take(16)}… " +
