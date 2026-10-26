@@ -277,6 +277,16 @@ class CarLifeHuClient(
     fun touchUp(x: Int, y: Int) = enqueueTouch(CarLifeProtocol.TOUCH_UP, x, y)
 
     /**
+     * 复合动作（0x68001）：`action` 为原始 MotionEvent 动作码，指针索引在 action 的高字节。
+     * 双指手势用它——单点消息的负载只有 x/y，无法表达「哪根手指」。
+     */
+    fun touchAction(
+        action: Int,
+        x: Int,
+        y: Int,
+    ) = enqueueTouch(CarLifeProtocol.TOUCH_ACTION, x, y, action)
+
+    /**
      * 触摸下发队列。
      *
      * 为什么不在调用线程上直接写 socket：CarLife 引擎处理触摸是**串行**的，
@@ -303,6 +313,7 @@ class CarLifeHuClient(
         serviceType: Int,
         x: Int,
         y: Int,
+        action: Int = -1,
     ) {
         if (touchOut == null) return
         // 只做安全范围约束，**不按视频分辨率（SPS/协商档位）钳位**：
@@ -314,25 +325,33 @@ class CarLifeHuClient(
         touchLock.lock()
         try {
             if (!running.get()) return
-            if (serviceType == CarLifeProtocol.TOUCH_MOVE) {
+            if (isMoveEvent(serviceType, action)) {
                 // 队尾已是 MOVE：直接覆盖坐标，等价于「只发最新位置」。
                 val last = touchQueue.lastOrNull()
-                if (last != null && last[0] == CarLifeProtocol.TOUCH_MOVE) {
+                if (last != null && isMoveEvent(last[0], last[3])) {
                     last[1] = px
                     last[2] = py
                     return
                 }
             }
             if (touchQueue.size >= TOUCH_QUEUE_MAX) {
-                val removable = touchQueue.indexOfFirst { it[0] == CarLifeProtocol.TOUCH_MOVE }
+                val removable = touchQueue.indexOfFirst { isMoveEvent(it[0], it[3]) }
                 if (removable >= 0) touchQueue.removeAt(removable) else return
             }
-            touchQueue.addLast(intArrayOf(serviceType, px, py))
+            touchQueue.addLast(intArrayOf(serviceType, px, py, action))
             touchReady.signalAll()
         } finally {
             touchLock.unlock()
         }
     }
+
+    /** 是不是「可合并的移动事件」：单点 MOVE，或复合动作里的 ACTION_MOVE。 */
+    private fun isMoveEvent(
+        serviceType: Int,
+        action: Int,
+    ): Boolean =
+        serviceType == CarLifeProtocol.TOUCH_MOVE ||
+            (serviceType == CarLifeProtocol.TOUCH_ACTION && action >= 0 && (action and 0xFF) == CarLifeProtocol.TouchAction.MOVE)
 
     private fun startTouchWorker() {
         if (touchWorker?.isAlive == true) return
@@ -350,7 +369,7 @@ class CarLifeHuClient(
                     touchLock.unlock()
                 }
                 if (!running.get()) break
-                if (event != null) sendTouch(event[0], event[1], event[2])
+                if (event != null) sendTouch(event[0], event[1], event[2], event[3])
             }
         }, "carlife-touch").apply {
             isDaemon = true
@@ -368,15 +387,20 @@ class CarLifeHuClient(
         serviceType: Int,
         x: Int,
         y: Int,
+        action: Int,
     ) {
         val out = touchOut ?: return
         val px = x.coerceIn(0, TOUCH_COORD_MAX)
         val py = y.coerceIn(0, TOUCH_COORD_MAX)
-        val frame =
-            CarLifeProtocol.packCommand(
-                serviceType,
-                CarLifeProtocol.touchPoint(px, py),
-            )
+        // 复合动作（0x68001）的负载是 CarlifeTouchAction{action,x,y}，
+        // 单点消息（0x68002/3/4）的负载是 CarlifeTouchSinglePoint{x,y}——两者不能混用。
+        val payload =
+            if (serviceType == CarLifeProtocol.TOUCH_ACTION) {
+                CarLifeProtocol.touchAction(action, px, py)
+            } else {
+                CarLifeProtocol.touchPoint(px, py)
+            }
+        val frame = CarLifeProtocol.packCommand(serviceType, payload)
         sentTouchCount++
         if (!runCatching { out.write(frame); out.flush() }.isSuccess) {
             touchWriteFailures++

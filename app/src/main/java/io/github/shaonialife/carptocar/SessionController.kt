@@ -2157,12 +2157,12 @@ object SessionController {
                                                 report != null && report.size == 1 -> rawValue?.takeIf { it != 0 }
                                                 else -> null
                                             }
+                                        // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
+                                        // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
+                                        val touchFormat =
+                                            descriptor?.let(TouchReports::formatFromDescriptor)
                                         val contacts =
                                             if (consumerUsage == null && report != null) {
-                                                // 触摸格式按设备描述符判定（Digitizer 页 + 单指/多槽），
-                                                // 描述符不可用时按报文长度回退——不依赖车机型号或 uuid
-                                                val touchFormat =
-                                                    descriptor?.let(TouchReports::formatFromDescriptor)
                                                 TouchReports.parse(report, touchFormat)
                                             } else {
                                                 null
@@ -2192,6 +2192,18 @@ object SessionController {
                                             // **抬起永远记录**——排查手势卡死时最需要看的就是
                                             // 「UP 到底有没有从车机发过来」。
                                             // 只看 slot 0：多槽格式里 slot 1 常驻 (0,0)↑ 占位。
+                                            if (touchLogCount == 0) {
+                                                // 双指能不能用，第一眼看这里：单指绝对坐标的
+                                                // 报文里根本没有第二个触点的位置，双指无从谈起。
+                                                appendLog(
+                                                    "EVENT: 触摸格式 " +
+                                                        when (touchFormat) {
+                                                            TouchReports.Format.MULTI_SLOT -> "多槽（最多 2 指）"
+                                                            TouchReports.Format.SINGLE_ABSOLUTE -> "单指绝对坐标（车机只报一个触点）"
+                                                            null -> "未知（按报文长度 ${report?.size} B 回退）"
+                                                        },
+                                                )
+                                            }
                                             val hasRelease = contacts.any { it.slot == 0 && !it.down }
                                             if (hasRelease || touchLogCount <= 30 || touchLogCount % 50 == 0) {
                                                 appendLog(

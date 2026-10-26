@@ -172,6 +172,28 @@ object CarLifeHijack {
     @Volatile
     private var touchPressed = false
 
+    // ---- 双指（HID 槽 1）----
+    //
+    // 单点消息 0x68002/3/4 的负载是 CarlifeTouchSinglePoint{x,y}，没有指针概念，
+    // 第二根手指无从表达。旧实现直接 `if (slot != 0) return true` 把它吞掉，
+    // 所以双指缩放完全没反应。双指手势改走复合动作 0x68001
+    // （负载 CarlifeTouchAction{action,x,y}，action 是原始 MotionEvent 动作码，
+    // 指针索引在高字节），单指仍走已验证的单点通道，互不影响。
+
+    /** 槽 1 是否按住。 */
+    private var slot1Down = false
+
+    /** 槽 1 最近坐标（视频域）。 */
+    private var slot1X = 0
+    private var slot1Y = 0
+
+    /** 本次手势是否已切换到复合动作通道（从第二根手指按下的那一刻起，直到整笔结束）。 */
+    @Volatile
+    private var multiActive = false
+
+    /** 本次双指手势内已发出的 MOVE 条数（日志节流 + 摘要用）。 */
+    private var multiMoves = 0
+
     private var lastTouchAt = 0L
     private var touchCount = 0
 
@@ -309,6 +331,9 @@ object CarLifeHijack {
         touchPressed = false
         touchCount = 0
         gestureMoves = 0
+        slot1Down = false
+        multiActive = false
+        multiMoves = 0
         observedMaxX = 0
         observedMaxY = 0
         hasVideo = false
@@ -414,6 +439,9 @@ object CarLifeHijack {
         audioSink = null
         touchPressed = false
         gestureMoves = 0
+        slot1Down = false
+        multiActive = false
+        multiMoves = 0
         worker?.interrupt()
         worker = null
         logSink = null
@@ -840,7 +868,8 @@ object CarLifeHijack {
         down: Boolean,
     ): Boolean {
         if (!isActive) return false
-        if (slot != 0) return true // 只支持单指；多指其余槽直接吞掉，避免漏到注入路径
+        // HID 触摸报文最多两槽（TouchReports.SLOTS）；再多的槽位直接吞掉，避免漏到注入路径
+        if (slot < 0 || slot > 1) return true
         val hu = client ?: return true
         if (viewW <= 0 || viewH <= 0) return true
 
@@ -849,6 +878,12 @@ object CarLifeHijack {
         val ty = y.coerceIn(0, viewH - 1)
         if (x > observedMaxX) observedMaxX = x
         if (y > observedMaxY) observedMaxY = y
+
+        // 槽 1 单独处理：它只会让整笔手势切换到复合动作通道，不参与单点状态机。
+        if (slot == 1) {
+            onSecondPointer(hu, tx, ty, down, x, y)
+            return true
+        }
 
         // ---- 手势收尾：车机漏发 UP 会让引擎永久卡在「按住」状态 ----
         //
@@ -895,13 +930,21 @@ object CarLifeHijack {
                 lastMoveX = tx
                 lastMoveY = ty
                 gestureMoves++
-                hu.touchMove(tx, ty)
+                if (multiActive) {
+                    // 双指手势已切换到复合动作通道，第一根手指的移动也得走同一条通道，
+                    // 否则引擎会在两条通道上各维护一套指针状态（实测会互相覆盖）。
+                    multiMoves++
+                    hu.touchAction(CarLifeProtocol.TouchAction.MOVE, tx, ty)
+                } else {
+                    hu.touchMove(tx, ty)
+                }
             }
 
             touchPressed -> {
                 // 短促且几乎没有位移 = 点击：用按下点收尾，避免车机端把轻微抖动
-                // 当拖动、或把抬起坐标算到相邻控件上。
-                val isTap = now - tapStartedAt <= TAP_MAX_MS &&
+                // 当拖动、或把抬起坐标算到相邻控件上。双指手势不算点击。
+                val isTap = !multiActive &&
+                    now - tapStartedAt <= TAP_MAX_MS &&
                     kotlin.math.abs(tx - downX) <= TAP_MAX_DRIFT_PX &&
                     kotlin.math.abs(ty - downY) <= TAP_MAX_DRIFT_PX
                 finishGesture(
@@ -926,6 +969,61 @@ object CarLifeHijack {
         return true
     }
 
+    /**
+     * 第二根手指（HID 槽 1）。
+     *
+     * 按下 → 整笔手势切到复合动作通道，先发 `ACTION_POINTER_DOWN | (1 shl 8)`；
+     * 移动 → 发 `ACTION_MOVE`（带该手指坐标）；抬起 → `ACTION_POINTER_UP | (1 shl 8)`。
+     * 之后第一根手指仍由 [handleTouch] 的槽 0 分支继续走复合通道，直到整笔结束。
+     */
+    private fun onSecondPointer(
+        hu: CarLifeHuClient,
+        tx: Int,
+        ty: Int,
+        down: Boolean,
+        rawX: Int,
+        rawY: Int,
+    ) {
+        val act = CarLifeProtocol.TouchAction
+        if (!down) {
+            if (!slot1Down) return
+            slot1Down = false
+            if (multiActive && touchPressed) {
+                hu.touchAction(act.withPointer(act.POINTER_UP, 1), slot1X, slot1Y)
+                logSink?.invoke("CARLIFE: 多指 ↑2 ($slot1X,$slot1Y) → POINTER_UP（手指 1）")
+            }
+            return
+        }
+        // 第一根手指还没按下就来了槽 1：多半是车机把占位槽报成按下，忽略
+        if (!touchPressed) return
+        if (!slot1Down) {
+            slot1Down = true
+            slot1X = tx
+            slot1Y = ty
+            if (!multiActive) {
+                multiActive = true
+                multiMoves = 0
+                gestureMoves = 0
+                hu.touchAction(act.withPointer(act.POINTER_DOWN, 1), tx, ty)
+                logSink?.invoke(
+                    "CARLIFE: 多指 ↓2 ($rawX,$rawY)→($tx,$ty) 进入双指模式" +
+                        "（复合动作 0x68001，手指 1 按下）",
+                )
+            }
+            return
+        }
+        // 已按住：坐标变化即该手指移动
+        if (tx == slot1X && ty == slot1Y) return
+        slot1X = tx
+        slot1Y = ty
+        if (!multiActive) return
+        multiMoves++
+        hu.touchAction(act.MOVE, tx, ty)
+        if (multiMoves <= 5 || multiMoves % 20 == 0) {
+            logSink?.invoke("CARLIFE: 多指 移动2 ($tx,$ty) MOVE#${multiMoves}")
+        }
+    }
+
     /** 结束一笔手势：发 UP，并按需打印拖动摘要（点击不刷屏）。 */
     private fun finishGesture(
         hu: CarLifeHuClient,
@@ -939,12 +1037,30 @@ object CarLifeHijack {
         lastTouchAt = now
         lastMoveX = ux
         lastMoveY = uy
-        hu.touchUp(ux, uy)
+        val act = CarLifeProtocol.TouchAction
+        if (multiActive) {
+            // 双指手势：先把还按着的手指 1 抬起，再用 ACTION_UP 收尾。
+            // 顺序反了会让引擎留下一个永不放开的幽灵触点。
+            if (slot1Down) {
+                hu.touchAction(act.withPointer(act.POINTER_UP, 1), slot1X, slot1Y)
+                slot1Down = false
+            }
+            hu.touchAction(act.UP, ux, uy)
+            logSink?.invoke(
+                "CARLIFE: 双指手势结束（手指 2 移动 ${multiMoves} 次）→ 复合通道 UP" +
+                    (if (abnormal != null) " · $abnormal" else ""),
+            )
+            multiActive = false
+            multiMoves = 0
+        } else {
+            slot1Down = false
+            hu.touchUp(ux, uy)
+        }
         val duration = now - gestureStartAt
         val span = kotlin.math.abs(ux - downX) + kotlin.math.abs(uy - downY)
         if (abnormal != null) {
             logSink?.invoke("CARLIFE: $abnormal → 补发 UP ($ux,$uy)")
-        } else if (gestureMoves >= 3 || duration >= 300L) {
+        } else if (!multiActive && (gestureMoves >= 3 || duration >= 300L)) {
             logSink?.invoke(
                 "CARLIFE: 手势结束 ${gestureMoves}次移动 时长${duration}ms " +
                     "位移${span}px ↓($downX,$downY) → UP($ux,$uy)",

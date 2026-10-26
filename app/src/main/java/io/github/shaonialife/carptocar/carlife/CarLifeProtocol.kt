@@ -111,10 +111,34 @@ internal object CarLifeProtocol {
     //   0x68001（复合动作，action 缺省=按下）→ 0x68002（=抬起！）→ …
     // 手指刚动第一下引擎就收到「抬起」，手势立刻结束，只剩原地一次点击。
     // 表现正是「能点、点得准，但拖不动、列表不跟手」。坐标映射一直是对的，别再去调缩放。
-    const val TOUCH_ACTION = 425985 // 0x68001 复合动作（保留，未使用）
+    const val TOUCH_ACTION = 425985 // 0x68001 复合动作：负载带原始动作码，双指手势走这里
     const val TOUCH_DOWN = 425986 // 0x68002
     const val TOUCH_UP = 425987 // 0x68003
     const val TOUCH_MOVE = 425988 // 0x68004
+
+    /**
+     * [TOUCH_ACTION] 负载里的动作码——就是 Android `MotionEvent` 的动作码，
+     * 指针索引放在高字节（`action or (index shl 8)`），与官方 HU SDK
+     * 「新触摸方式」`sendAction(event.getX(), event.getY(), event.getAction())` 一致。
+     *
+     * 为什么双指必须走这条路：单点消息（0x68002/3/4）的负载是
+     * `CarlifeTouchSinglePoint{x,y}`，**没有指针概念**，第二根手指无从表达——
+     * 旧实现直接把 slot 1 丢掉，双指缩放自然按不出来。
+     */
+    object TouchAction {
+        const val DOWN = 0
+        const val UP = 1
+        const val MOVE = 2
+        const val POINTER_DOWN = 5
+        const val POINTER_UP = 6
+        const val POINTER_INDEX_SHIFT = 8
+
+        /** 给动作码带上指针索引（槽 0 → 手指 0，槽 1 → 手指 1）。 */
+        fun withPointer(
+            base: Int,
+            pointerIndex: Int,
+        ): Int = base or (pointerIndex shl POINTER_INDEX_SHIFT)
+    }
 
     const val HEARTBEAT = 131074
 
@@ -312,13 +336,28 @@ internal object CarLifeProtocol {
     }
 
     /**
-     * 单点触控负载 `CarlifeTouchSinglePoint{x=1, y=2, pointerx=3, pointery=4}`。
+     * 单点触控负载 `CarlifeTouchSinglePoint{x=1, y=2}`（proto 里只有这两个字段）。
      * 注意动作不在负载里——DOWN/MOVE/UP 分别用 [TOUCH_DOWN]/[TOUCH_MOVE]/[TOUCH_UP]。
      */
     fun touchPoint(
         x: Int,
         y: Int,
     ): ByteArray = pbVarint(1, x) + pbVarint(2, y)
+
+    /**
+     * 复合动作负载 `CarlifeTouchAction{action=1, x=2, y=3}`。
+     *
+     * `action` 是**原始 MotionEvent 动作码**，指针索引用 Android 的高字节约定：
+     * 第二根手指按下 = `ACTION_POINTER_DOWN or (1 shl 8)` = 261，抬起 = 262。
+     * 这是官方 HU SDK「新触摸方式」（`TouchListenerManager.sendAction`）的用法，
+     * 也是这条通道里**唯一能表达「哪根手指」**的地方——单点消息（0x68002/3/4）
+     * 的负载只有 x/y，多点手势靠它无从表达，这正是「双指按不出来」的根因。
+     */
+    fun touchAction(
+        action: Int,
+        x: Int,
+        y: Int,
+    ): ByteArray = pbVarint(1, action) + pbVarint(2, x) + pbVarint(3, y)
 
     /** 解析 65574 模块状态列表，返回 (moduleId, status) 列表。 */
     fun parseModuleStatus(payload: ByteArray): List<Pair<Int, Int>> {
