@@ -72,3 +72,42 @@ CarLife 侧（`CarLifeHuClient`）连的是本机端口，不涉及网络闪断�
   「蓝牙就绪，等待车机回连…」。
 - **待真车验证**：别克 E2LB 上车看三点——① 日志出现 `车机可收清单未声明 0x4e0d/0x4e0e ……仍照常发送`；
   ② 断链后不再出现「已有会话在处理中，忽略本次端点」；③ 熄火后画面冻结能在 ~20s 内被判定断链。
+
+---
+
+## 附：1.0.12「音频隔离」回退（2026-10-27）
+
+**现象**：1.0.11 装机后，车机上地图导航播报无声（画面正常）。
+
+**先查证据：音频代码到底有没有被这轮改动碰过**
+
+```
+git log --oneline abd1cf9..HEAD            # main → bieke 共 9 笔
+git log --oneline abd1cf9..HEAD -- app/src/main/java/io/github/shaonialife/carptocar/audio \
+                                   app/src/main/java/io/github/shaonialife/carptocar/carlife/CarLifeAudioSink.kt
+# → 空
+```
+
+结论：`audio/` 全目录与 `CarLifeAudioSink` 在这 9 笔里**零改动**，1.0.11 与 1.0.7(main)
+的音频代码逐字相同。音频数据面是 `DatagramSocket`（UDP RTP），与 TCP keepalive 无关。
+
+**但有一处物理交集，已撤**
+
+1.0.11 给 AirPlay **控制通道 / 事件通道**加了 `TcpLiveness`（keepalive 10s/3s/3 +
+`TCP_USER_TIMEOUT=20s`）。音频包本身是 UDP，但下面这些都跑在控制通道上：
+
+- 音频 `SETUP`（协商 dataPort / controlPort / streamConnectionID）
+- `SET_PARAMETER volume`（探测与修正静音位）
+- `feedback` 心跳（车机据此排播）
+
+所以「socket 级超时可能影响音频通路建立/维持」是唯一站得住的怀疑链，已在 1.0.12 撤回：
+**控制通道与事件通道恢复为 1.0.10 的原始设置**（`soTimeout` 分别为 0 / 30s，无内核级超时）。
+视频数据口的 keepalive 保留（纯视频单向写，与音频无交集）。
+
+**版本**：1.0.12（10012），208 用例全绿，`dist/CarPToCarL-1.0.12-audio-safe.apk`。
+
+**若复测仍无声**，按 `docs/audio-call-issues.md` 的三行日志判读，不要再猜代码：
+
+1. `AIRPLAY: ✓ 音频流协商成功 … dataPort=…` —— 没有则音频 SETUP 被拒（换档位问题）；
+2. `AUDIO: 首帧` 与 `CARLIFE: 媒体 音频格式宣告` —— 没有则 CarLife 引擎没推 PCM（导航播报不一定能唤醒引擎）；
+3. `CARLIFE: 音乐会话暂停——丢弃引擎残留 PCM` 连续出现 —— 导航被 15s 暂停窗口吞掉（那才需要动音频代码）。
