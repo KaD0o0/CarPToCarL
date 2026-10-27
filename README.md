@@ -20,14 +20,14 @@
 **最新正式版**（免编译，直接装）：
 
 > **[`CarPToCarL-latest.apk`](https://github.com/jjuugk/CarPToCarL/releases/latest/download/CarPToCarL-latest.apk)**
-> —— 固定直链，永远指向最新一版（当前 1.0.7，13.2 MB）
+> —— 固定直链，永远指向最新一版（当前 1.0.13，13.3 MB）
 
 | 项        | 值                                                                              |
 | -------- | ------------------------------------------------------------------------------ |
 | 全部版本     | [Releases 页面](https://github.com/jjuugk/CarPToCarL/releases)（含更新日志与历史版本）        |
-| 本版固定包    | [`CarPToCarL-1.0.7-release.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.0.7/CarPToCarL-1.0.7-release.apk) |
+| 本版固定包    | [`CarPToCarL-1.0.13-release.apk`](https://github.com/jjuugk/CarPToCarL/releases/download/v1.0.13/CarPToCarL-1.0.13-release.apk) |
 | 系统要求     | Android 12 及以上（minSdk 31）                                                      |
-| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 ~ 1.0.6，但不要与其它来源的包混装                    |
+| 签名       | 作者个人调试证书（仓库不含发布密钥）→ 可直接**覆盖安装** 1.0.0 ~ 1.0.7，但不要与其它来源的包混装                    |
 | 安装       | 系统安装器直接装，或 `adb install -r CarPToCarL-latest.apk`                              |
 | 前置       | 手机需装 **CarLife+**（荣耀机型为 `com.baidu.carlife.honor`）                             |
 
@@ -40,7 +40,7 @@
 
 | 项    | 值                                                                             |
 | ---- | ----------------------------------------------------------------------------- |
-| 当前版本 | `1.0.7`（正式版；双指触控改走复合动作通道 `0x68001`，修「双指缩放没反应」；未填本机蓝牙地址不再允许启动连接；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
+| 当前版本 | `1.0.13`（正式版；接入 CarLife TTS 通道 `9241`，修「地图导航播报没声音」；新增「设备适配」一轮连接修复；版本号唯一来源是 `app/build.gradle.kts` 顶部 `appVersionName`） |
 | 下载   | **[最新正式版 APK](https://github.com/jjuugk/CarPToCarL/releases/latest)**（见上方「立即下载」）       |
 | 包名   | `io.github.shaonialife.carptocar`                                             |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                                     |
@@ -278,7 +278,7 @@ App 侧不需要再改什么：`carlife_fps` 默认就是 **60**，连接建立 
 | AirPlay 主会话      | ✅     | PairVerify + H.264 推流 + HID 触摸回传                                                     |
 | 真车验证（奥迪 MIB3）    | ✅     | 2026-10-11 全通：视频上屏 + 触摸可交互                                                           |
 | CarLife 画面直通     | ✅     | 劫持本机引擎码流，不重编码                                                                        |
-| CarLife 音频直通     | ✅     | PCM → RTP，支持播放/暂停联动                                                                  |
+| CarLife 音频直通     | ✅     | **两条通道都接**：媒体（`9240`，`0x3000x`）+ TTS/导航播报（`9241`，`0x4xxxx`）→ PCM → RTP；媒体通道支持播放/暂停联动，TTS 不参与该联动 |
 | 歌名 / 歌手 / 歌词     | ✅     | 98386 `MEDIA_LYRIC_SUPPORT=1` + iAP2 NowPlaying                                      |
 | 车机分辨率自适应         | ⚠️    | 98311 上报车机真实视图 + `needAdapterScreen=true`；**但受厂商 mix 层限制，实际码流可能仍为 1280×720 或 1080p** |
 | 触摸回传             | ✅     | 车机触摸 → CarLife 通道注入；坐标以 **SPS 真实分辨率**为基准，触摸异步队列不积压                                   |
@@ -814,6 +814,54 @@ app/src/main/aidl/io/github/shaonialife/carptocar/input/ICarInput.aidl
 ---
 
 ## 十一、版本历史
+
+### 1.0.13 —— 2026-10-27（正式版 · 导航播报有声 + 连接稳定性）
+
+> 1.0.8 ~ 1.0.12 是同一轮设备适配的开发迭代（只出过 dev 包，未单独发版），
+> 内容一并合入本版。1.0.7 → 1.0.13 的核心是两件事：**把导航播报接进来**、
+> **把「连上又断」的一串问题按真车日志逐条堵掉**。
+
+**修一（本版主项）：车机上放音乐有声音，地图导航播报完全没声音。**
+
+- **根因不是「音量太小」，是那条流从来没被接**：CarLife 有**两条独立音频流**——
+  媒体 `9240`（包类型 `0x3000x`）与 **TTS `9241`（包类型 `0x4xxxx`，导航播报/语音提示）**。
+  `CarLifeHuClient.audioReader()` 的 `when(type)` 只列了媒体那四个常量，
+  TTS 包全部落进 `else` →「暂不处理」→ 丢弃。日志里那条 1280 字节的导航 PCM
+  就是这样被扔掉的（`0x40003 音频包（长度 1280，暂不处理）`）。
+- **第二层原因**：媒体 sink 有「音乐会话暂停 → 丢弃引擎残留 PCM」的联动，
+  而导航播报恰好发生在音乐暂停的时候，就算走媒体通道也会被吃掉。
+- **改法**：TTS 通道单独解析（`0x40001` 取格式，**任何带负载的包都当 PCM**，
+  长度 0 只记开停），TTS 用自己的 sink 且 `dropWhenPaused=false`，两路共用同一个
+  发送端做重采样（导航常 16 kHz 单声道，媒体 48 kHz 立体声）；`AudioSender.feedPcm`
+  加 `@Synchronized`，否则两路读线程写同一缓冲会半帧交错出爆音。
+- 复测看这三行：`TTS 音频格式宣告` / `✓ 收到导航播报音频（TTS 首包 …）` /
+  `音频直通 … 电平 xx%（非零 xx%）`。详见 [docs/audio-call-issues.md](docs/audio-call-issues.md)。
+
+**修二：连上之后反复断、或断了一次就再也连不回来（多台车机实测）。**
+
+- **能力清单从「硬门禁」退回「只记录」**：1.0.8 曾按车机 `0x1D01` 的可收清单裁剪，
+  清单里没 `0x4E0D/0x4E0E` 就真不发。真车证据推翻了这条判据——奥迪 MIB3 的清单只有
+  5 项、不含 `0x5702`，却完整支持无线 CarPlay（硬拦导致 7000 端口 `ECONNREFUSED` ×45）。
+  **清单只能证明「有」，不能证明「没有」**。WiFi 凭据分派改认「双清单都 ≥10 项仍无
+  `0x57xx`」（宝马 iD9 形态）才跳过旧协议。
+- **MFi 长度记忆支持硬拒绝**：挑战期间被对端断开时，即使该长度已记「成功」也要推翻
+  ——迟到应答归属歧义会把 32B 的成功记到 20B 头上，之后每轮必死在 `0xAA05`。
+- **僵尸轮次释放**：车机拆链后立刻回连，新端点会被「已有会话在处理中」拒掉，
+  只剩 keep-alive 干等。现在保活泵退出即释放互斥（≤200 ms 退场），新轮次清掉
+  `connectCancelled`。这修的是「每 ~40 秒一轮」的重连死循环。
+- **零回帧不再催问**：车机 `0x4300` 后一个字都不回时，催问（重发问候 + `0x4E0E` +
+  `0x4300`）本身就是拆链元凶，现改为静默保活。
+- **`0x4300` 报文体三档阶梯**：新版嵌套 → 老版平铺 → 不发，按车机身份持久化记忆。
+- **新增 `net/TcpLiveness`**：视频数据口启用 keepalive 10s/3s/3 + `TCP_USER_TIMEOUT=20s`
+  （内核默认两小时才探测，车机熄火不发 RST 时画面会永久冻结）。
+  AirPlay 控制/事件通道**不设**——控制通道上跑着音频 `SETUP`、`volume` 与 `feedback`，
+  1.0.12 曾因此误伤音频，已撤回。
+- 详见 [docs/cardeck-0.1.28-port.md](docs/cardeck-0.1.28-port.md)、
+  [docs/buick-e2lb-availability-silence.md](docs/buick-e2lb-availability-silence.md)、
+  [docs/gm-cinemo-4301-deadlock.md](docs/gm-cinemo-4301-deadlock.md)、
+  [docs/citroen-r4-sdp-no-service.md](docs/citroen-r4-sdp-no-service.md)。
+
+**其它**：测试增至 208 例（新增 `AvailabilityBodyMemory`、MFi 硬拒绝/矛盾档等用例）。
 
 ### 1.0.7 —— 2026-10-26（正式版 · 双指触控 + 蓝牙地址门禁）
 
