@@ -114,6 +114,16 @@ object CarLifeHijack {
 
     private var audioSink: CarLifeAudioSink? = null
 
+    /**
+     * TTS（导航播报）专用 sink。
+     *
+     * 为什么不复用 [audioSink]：TTS 是**独立音频流**（9241 端口），采样率常是 16k 单声道，
+     * 而且不能套用「音乐暂停 → 丢残留 PCM」的联动——导航恰恰多在音乐暂停时播报。
+     * 两者各自 configure，共用同一个 [io.github.shaonialife.carptocar.audio.AudioSender]
+     * （feedPcm 逐包带采样率，由发送端重采样到 48k 立体声）。
+     */
+    private var ttsSink: CarLifeAudioSink? = null
+
     /** 最近一条 CarLife 媒体信息（0x10035，歌名/歌手/封面）。供 iAP2 0x5001 转发。 */
     @Volatile
     var latestMediaInfo: CarLifeMediaInfo? = null
@@ -437,6 +447,8 @@ object CarLifeHijack {
         client = null
         audioSink?.stop()
         audioSink = null
+        ttsSink?.stop()
+        ttsSink = null
         touchPressed = false
         gestureMoves = 0
         slot1Down = false
@@ -480,6 +492,9 @@ object CarLifeHijack {
             announcedWait = false
             val sink = CarLifeAudioSink(logSink ?: {})
             audioSink = sink
+            // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃（见字段注释）
+            val naviSink = CarLifeAudioSink(logSink ?: {}, dropWhenPaused = false)
+            ttsSink = naviSink
             // 创建即应用当前播放状态：若此刻音乐已是 PAUSED，立刻截断（否则 listener 只在
             // 状态「变化」时触发，稳态 PAUSED 下新 sink 会漏掉这次联动）。
             // 注意：nowPlaying == null（读不到媒体会话：未授权通知使用权 / 本地模拟无会话）
@@ -493,6 +508,9 @@ object CarLifeHijack {
                 onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
                 onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
                 onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
+                // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端
+                onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
+                onTtsPcm = { pcm, size -> routeAudio(naviSink, pcm, size) },
                 onAudioGate = { active -> onEngineAudioGate(active) },
                 onMediaInfo = { info -> onMediaInfo(info) },
                 requestedFps = requestedFps,
@@ -526,6 +544,8 @@ object CarLifeHijack {
             if (client === hu) client = null
             sink.stop()
             if (audioSink === sink) audioSink = null
+            naviSink.stop()
+            if (ttsSink === naviSink) ttsSink = null
             hasVideo = false
             if (running.get()) sleep(1500)
         }

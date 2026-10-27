@@ -39,6 +39,16 @@ class CarLifeHuClient(
     private val onAudioFormat: (sampleRate: Int, channels: Int) -> Unit = { _, _ -> },
     /** 收到一包裸 PCM（16bit 交织，size 为有效字节数）。 */
     private val onAudioPcm: (pcm: ByteArray, size: Int) -> Unit = { _, _ -> },
+    /** TTS 通道（9241）宣告音频格式。导航播报通常是独立的采样率/声道，与媒体分开记。 */
+    private val onTtsFormat: (sampleRate: Int, channels: Int) -> Unit = { _, _ -> },
+    /**
+     * TTS 通道（9241）的裸 PCM —— **导航播报就走这里**。
+     *
+     * 2026-10-27 真机日志定谳：0x40003 带 1280B 负载 = 导航播报 PCM；旧实现把它归到
+     * 「暂不处理」直接丢掉，于是「放音乐有声、开导航没声」。TTS 与媒体是两条独立流，
+     * 采样率也可能不同（TTS 常见 16k 单声道），所以必须各自带格式送进发送端重采样。
+     */
+    private val onTtsPcm: (pcm: ByteArray, size: Int) -> Unit = { _, _ -> },
     /**
      * 引擎音频**开停信号**（0x30002 开始 / 0x30003 停止，长度 0 的裸类型包）。
      *
@@ -246,7 +256,7 @@ class CarLifeHuClient(
         }
         sockets[CarLifeProtocol.PORT_TTS]?.let { tts ->
             startReader("carlife-tts") {
-                audioReader(tts.getInputStream(), "TTS")
+                audioReader(tts.getInputStream(), "TTS", isTts = true)
             }
         }
         startReader("carlife-heartbeat") { heartbeatLoop() }
@@ -878,9 +888,15 @@ class CarLifeHuClient(
     private fun audioReader(
         input: InputStream,
         label: String,
+        isTts: Boolean = false,
     ) {
         val data = DataInputStream(input)
         var announced = false
+        // TTS 通道自己的格式（与媒体流无关：导航播报常见 16k 单声道，媒体是 48k 立体声）
+        var ttsRate = 0
+        var ttsChannels = 1
+        var ttsPackets = 0L
+        val ttsControlLogged = HashSet<Int>()
         try {
             while (running.get()) {
                 val head = ByteArray(CarLifeProtocol.AUDIO_HEAD_LEN)
@@ -893,6 +909,36 @@ class CarLifeHuClient(
                 }
                 val payload = ByteArray(length)
                 if (length > 0) data.readFully(payload)
+                if (isTts) {
+                    // TTS 通道（9241）：包类型是 0x4xxxx，但编号与媒体的 INIT/START/STOP
+                    // **不对应**（媒体数据在 0x30006，TTS 数据却在 0x40003）。只认两条铁律：
+                    // 有负载 = 裸 PCM（导航播报），长度 0 = 开停信号（仅记录）。
+                    if (type == CarLifeProtocol.TTS_PKG_INIT) {
+                        val format = parseAudioInit(payload)
+                        if (format != null) {
+                            val (rate, channelConfig, _) = format
+                            ttsRate = rate
+                            ttsChannels = channelsOf(channelConfig)
+                            log("CARLIFE: TTS 音频格式宣告 ${ttsRate}Hz ${ttsChannels}ch（导航播报通道）")
+                            onTtsFormat(ttsRate, ttsChannels)
+                        }
+                    } else if (length > 0) {
+                        if (ttsRate <= 0) {
+                            ttsRate = CarLifeProtocol.TTS_DEFAULT_RATE
+                            ttsChannels = 1
+                            log("CARLIFE: TTS 未宣告格式——按 ${ttsRate}Hz 单声道处理（发送端会重采样）")
+                            onTtsFormat(ttsRate, ttsChannels)
+                        }
+                        ttsPackets++
+                        if (ttsPackets == 1L) {
+                            log("CARLIFE: ✓ 收到导航播报音频（TTS 首包 ${length}B，${ttsRate}Hz ${ttsChannels}ch）")
+                        }
+                        onTtsPcm(payload, length)
+                    } else if (ttsControlLogged.add(type)) {
+                        log("CARLIFE: TTS 开停信号 0x${type.toString(16)}（长度 0，仅记录）")
+                    }
+                    continue
+                }
                 when (type) {
                     CarLifeProtocol.MUSIC_PKG_INIT -> {
                         val format = parseAudioInit(payload)
