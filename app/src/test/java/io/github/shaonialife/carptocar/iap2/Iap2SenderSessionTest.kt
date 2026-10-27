@@ -212,6 +212,9 @@ class Iap2SenderSessionTest {
         private val parser = Iap2Csm.Parser()
         private val pending = ArrayDeque<Iap2Csm.Frame>()
 
+        /** 收到过的「车机可收清单未声明」的消息（证明只记录不拦截）。 */
+        private val seenUndeclared = HashSet<Int>()
+
         fun run() {
             check(channel.awaitReady(10_000)) { "mock link not ready" }
 
@@ -248,11 +251,9 @@ class Iap2SenderSessionTest {
 
             // 设备状态问候**紧跟 0xAA05**（2026-10-26 起；上游 PR #17 的结论：
             // 车机据这批消息判定发送端已就绪，晚发会被当成还没起来）。
-            // 凯迪拉克形态（newProtocol）的可收清单里没有 0x4E0D——发送端必须按声明裁剪，
-            // 因此这里不能等它；其余形态（不声明清单 = 未知）照旧全量发送。
-            if (!newProtocol) {
-                expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
-            }
+            // 2026-10-27 起取消「按声明裁剪」：0x4E0D 即使不在可收清单里也照发
+            // （清单只能证明「有」不能证明「没有」，见 Iap2SenderSession.recordUndeclaredReceive）。
+            expect(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
             expect(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE)
             expect(Iap2MessageIds.DEVICE_INFORMATION_UPDATE)
             expect(Iap2MessageIds.DEVICE_TIME_UPDATE)
@@ -298,12 +299,12 @@ class Iap2SenderSessionTest {
             }
 
             if (newProtocol) {
-                // 0x4E0E（传输标识）不在凯迪拉克的可收清单里——发送端必须整条跳过，
-                // 所以这里再也不能靠「收到 0x4E0E」当 Phase 1 结束的信号。
-                // 改成静默窗口：盯够 8.6 秒（> 新协议 0x4301 的 8s 等待窗），
-                // 期间若有「车机声明不能收」的消息出现就判失败；窗口过后再补发 0x4301，
-                // 这样才真正落在「Phase 1 已结束、晚到补发」的时序上。
-                assertNoForbiddenMessages(8_600)
+                // 凯迪拉克的可收清单里没有 0x4E0D（无线可用）与 0x4E0E（传输标识），
+                // 但 2026-10-27 起**不再按声明裁剪**（清单只能证明「有」不能证明「没有」，
+                // 上游 0.1.28 奥迪 3315 定谳）：这两条必须照发，只留一条日志。
+                // 窗口给够 8.6 秒（> 新协议 0x4301 的 8s 等待窗），期间把收到的帧都记下来，
+                // 窗口过后再补发 0x4301——这样才真正落在「Phase 1 已结束、晚到补发」的时序上。
+                assertUndeclaredFramesStillSent(8_600)
                 sendStartSession()
             } else {
                 expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
@@ -316,21 +317,26 @@ class Iap2SenderSessionTest {
         }
 
         /**
-         * 断言一段时间内没有出现「车机声明不能收」的消息。
+         * 断言「车机声明不能收」的消息仍然照发（只记录不拦截）。
          *
          * 当前唯一来源是凯迪拉克 CT5（GM/Cinemo）的可收清单
          * `0x6801 0x4c01 0x4c04 0x5001 0x4e09 0x4e0a 0x4e0b 0x4e0c 0x4300`——
          * 其中没有 0x4E0D（无线可用）与 0x4E0E（传输标识）。
+         * 2026-10-27 起这两条**必须照发**：上游 0.1.28 的真车证据（奥迪 3315 清单只有
+         * 5 项、不含 0x5702 却完整支持）证明「没声明 ≠ 不能收」。
          */
-        private fun assertNoForbiddenMessages(windowMillis: Long) {
+        private fun assertUndeclaredFramesStillSent(windowMillis: Long) {
             val deadlineAt = System.nanoTime() + windowMillis * 1_000_000L
             while (true) {
                 val remaining = (deadlineAt - System.nanoTime()) / 1_000_000L
-                if (remaining <= 0) return
-                val frame = recvFrame(remaining) ?: continue
-                check(frame.messageId !in FORBIDDEN_FOR_CADILLAC) {
-                    "发送端发了车机没声明能收的 0x${frame.messageId.toString(16)}（按声明裁剪失效）"
-                }
+                if (remaining <= 0) break
+                recvFrame(remaining) ?: continue
+            }
+            val missing = UNDECLARED_FOR_CADILLAC - seenUndeclared
+            check(missing.isEmpty()) {
+                "取消裁剪后这些消息仍应照发，但没等到：" +
+                    missing.joinToString(" ") { "0x%04x".format(it) } +
+                    "（实际收到 " + seenUndeclared.joinToString(" ") { "0x%04x".format(it) } + "）"
             }
         }
 
@@ -407,11 +413,7 @@ class Iap2SenderSessionTest {
                     println("MOCK got 0x${frame.messageId.toString(16)}")
                     return
                 }
-                if (newProtocol && frame.messageId in FORBIDDEN_FOR_CADILLAC) {
-                    error(
-                        "发送端发了车机没声明能收的 0x${frame.messageId.toString(16)}——按声明裁剪失效",
-                    )
-                }
+                if (frame.messageId in UNDECLARED_FOR_CADILLAC) seenUndeclared += frame.messageId
                 skipped++
                 println("MOCK skip 0x${frame.messageId.toString(16)}（在等 0x${messageId.toString(16)}）")
                 check(skipped <= 64) {
@@ -424,18 +426,20 @@ class Iap2SenderSessionTest {
         private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
             pending.firstOrNull()?.let {
                 pending.removeFirst()
+                if (it.messageId in UNDECLARED_FOR_CADILLAC) seenUndeclared += it.messageId
                 return it
             }
             val bytes = channel.recvControl(timeoutMillis) ?: return null
             val frames = parser.offer(bytes)
             if (frames.isEmpty()) return null
             frames.forEachIndexed { index, frame -> if (index > 0) pending += frame }
+            frames.first().let { if (it.messageId in UNDECLARED_FOR_CADILLAC) seenUndeclared += it.messageId }
             return frames.first()
         }
 
         private companion object {
-            /** 凯迪拉克 CT5 可收清单里缺的两条（见 [assertNoForbiddenMessages]）。 */
-            val FORBIDDEN_FOR_CADILLAC =
+            /** 凯迪拉克 CT5 可收清单里缺的两条（见 [assertUndeclaredFramesStillSent]）。 */
+            val UNDECLARED_FOR_CADILLAC =
                 setOf(
                     Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
                     Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,

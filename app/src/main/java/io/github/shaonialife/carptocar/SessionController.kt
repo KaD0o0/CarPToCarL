@@ -498,6 +498,25 @@ object SessionController {
     }
 
     /**
+     * 发送端 BT 链路断开（保活泵退出）。配对进行中（未推流）时本轮已注定失败——
+     * 立即释放「会话处理中」互斥并唤醒卡住的等待。
+     *
+     * 为什么必须做（上游 0.1.14 奥迪 3315 真机定谳，别克 E2LB 同症）：车机 15s 看门狗
+     * 拆链后**立刻回连**并完整重走 Phase 1，新端点却被上一轮还卡在 WiFi 加入里的
+     * 僵尸轮次挡住（「已有会话在处理中」），于是只剩 keep-alive 干等到用户放弃。
+     *
+     * 置 [connectCancelled] 让卡在 WiFi 加入等分片检查的配对线程在 ≤200ms 内退场；
+     * **不停 BT 组件**（车机大概率立刻回连，监听必须留着）。新轮次起步处会清掉本标志。
+     */
+    fun onSenderLinkClosed() {
+        if (videoSender?.isRunning == true) return
+        if (sessionStarting.compareAndSet(true, false)) {
+            connectCancelled = true
+            appendLog(">>> 本轮蓝牙链路断开——释放「会话处理中」，等待车机重连端点接手")
+        }
+    }
+
+    /**
      * 最近一次 0x5703 的热点密码（仅内存，不落盘）。
      * 「车机热点 → 去连接」按钮复制到剪贴板用（手动加入兜底场景）。
      */
@@ -562,6 +581,7 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "车机回连") },
                     targetProvider = targetProvider,
                     nowPlayingProvider = nowPlayingProvider,
+                    onLinkClosed = ::onSenderLinkClosed,
                 )
             bluetoothClient =
                 Iap2BluetoothClient(
@@ -572,6 +592,7 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     targetProvider = targetProvider,
                     nowPlayingProvider = nowPlayingProvider,
+                    onLinkClosed = ::onSenderLinkClosed,
                 )
             ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
             endpointBrowser =
@@ -1985,6 +2006,10 @@ object SessionController {
             appendLog(">>> [$source] 已有会话在处理中，忽略本次端点（等待上一轮结束）")
             return
         }
+        // 新轮次起步清取消标志：上一轮可能因「BT 链路断开」置位退出（见
+        // onSenderLinkClosed）——能走到这里说明 BT 组件仍在运行（用户取消路径会
+        // 停组件、被上方守卫拦截），该标志属于已退场的旧轮次，不清会误伤本轮。
+        connectCancelled = false
         // 新一轮交接开始：清掉上一轮（可能中途失败）遗留的晚到端点暂存，
         // 否则它会在本轮的 drain 阶段覆盖掉本会话刚解析出的端点。
         pendingEndpointUpdate = null

@@ -36,6 +36,8 @@ class Iap2BluetoothServer(
     private val targetProvider: () -> TargetDevicePrefs.Target? = { null },
     /** 「正在播放」信息提供者（歌名/歌手/专辑，见 [Iap2SenderSession]）。 */
     private val nowPlayingProvider: (() -> CarPlayNowPlaying?)? = null,
+    /** 保活泵退出（BT 链路断开）时回调：主控据此释放「会话处理中」（僵尸轮次堵门修复）。 */
+    private val onLinkClosed: () -> Unit = {},
 ) {
     companion object {
         /**
@@ -165,6 +167,7 @@ class Iap2BluetoothServer(
                 onEndpointUpdate,
                 nowPlayingProvider,
                 onSessionReady = { session -> senderSession = session },
+                onLinkClosed = onLinkClosed,
             )
         } catch (error: IOException) {
             log("SESSION 失败: ${error.message}")

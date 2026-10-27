@@ -1,0 +1,74 @@
+# 上游 cardeck 0.1.28 移植记录（2026-10-27）
+
+对照文档：`cardeck/docs/carplay-connection-compare-0.1.28.md`（本地 `09eebb0` → 远端 `503ed37`，相差 42 笔）。
+本次只移植**与「连不上」直接相关、且在别克 E2LB / 凯迪拉克 CT5 上有对照证据**的四项，其余（WFI 入网分级、
+0x4301 窗口保活、自动连接等）此前已在 bieke 分支各自实现过，不重复搬。
+
+## 1. 能力清单从「硬门禁」退回「只记录」
+
+**改动**：`Iap2SenderSession`
+
+- `accessoryCanReceive()`（真不发）→ `recordUndeclaredReceive()`（**照发**，只记一条日志）。
+  涉及 `0x4E0D`（无线可用）、`0x4E0C`（设备 UUID）、`0x4E0E`（传输标识）三条可选消息。
+- WiFi 凭据分派改认 `ReceiverProfile.wifiGen`：只有 `NEW`（两清单合计 ≥10 项仍无 `0x57xx`，
+  宝马 iD9 形态）才跳过 `0x5702`；`LEGACY`/`UNKNOWN` 一律发。
+
+**为什么推翻自己（1.0.8 的裁剪）**：上游 0.1.28 的真车证据是「清单只能证明『有』，不能证明『没有』」——
+
+- 奥迪 3315 的可收清单只有 5 项、不含 `0x5702`，但它完整支持 `0x5702→0x5703`，
+  而且**要靠收到 0x5702 才把 AirPlay 服务拉起来**（旧实现按清单硬拦 → 7000 端口全程
+  ECONNREFUSED ×45 → 全灭）；
+- 同一天日志里 `0x4e0d/0x4e0b/0x4e0e` 不在清单内，车机却逐条 ACK 到位；
+- 别克 E2LB 侧的对照同样无效：裁掉这三条之后车机仍是「ACK 后沉默」，
+  说明它卡的不是「收到了多余帧」，而是应用层没被唤醒（见 `buick-e2lb-availability-silence.md`）。
+
+`0x4300` 从来不在裁剪范围（它是驱动 `0x4301` 的请求本身），本次不变。
+
+## 2. MFi 挑战长度记忆支持「硬拒绝」
+
+**改动**：`MfiLengthMemory.recordHardRejected()` + `orderAttempts()`；`Iap2SenderSession.runMfiChallenge()`
+
+- 挑战期间被对端断开 = 强证据：**即使该长度等于已记「成功」，也清 `succeeded` 并记 `rejected`**。
+  原先的 `recordRejected()` 遇到「与成功档相同」会直接放弃更新，于是迟到应答的误记永远洗不掉。
+- `orderAttempts()` 把「成功 ∧ 被拒」的矛盾档降级为普通候选（排在被拒档之前，仍会试到）。
+
+**病因**（上游 DiPlay 0.1.24 实测）：32B 的迟到应答被记到 20B 头上 → 之后每轮 20B 都被断链、
+记忆永久锁死、每轮死在发 `0xAA05` 之前。
+
+## 3. 僵尸轮次释放（`onLinkClosed`）
+
+**改动**：`BtSession.runSenderSession()` 保活泵退出后回调 `onLinkClosed` →
+`Iap2BluetoothClient/Server` 透传 → `SessionController.onSenderLinkClosed()`
+
+- 未推流且配对进行中：立即 `sessionStarting.compareAndSet(true, false)` + 置 `connectCancelled`，
+  让卡在 WiFi 加入里的配对线程 ≤200ms 退场；**不停 BT 组件**（车机会立刻回连）。
+- `onCarPlayEndpoint()` 抢到互斥后清 `connectCancelled`（属于已退场旧轮次）。
+
+**病因**：车机 15s 看门狗拆链 → 立刻回连并重走 Phase 1 → 新端点被上一轮「已有会话在处理中」拒绝
+→ 只剩 keep-alive 干等到用户放弃。别克 E2LB 日志里每 ~40 秒一轮的循环正是这条死锁链。
+
+## 4. `TcpLiveness`（长连接健康检查）
+
+**新增**：`net/TcpLiveness.kt`；接入三处
+
+| 位置 | label |
+| --- | --- |
+| `AirPlayClient` 控制通道 | 控制通道 |
+| `AirPlayClient` 事件通道 | 事件通道 |
+| `VideoSender.openDataPort()` / `reconnectDataPort()` | 视频数据口 |
+
+参数 `keepalive idle=10s / interval=3s / count=3` + `TCP_USER_TIMEOUT=20s`（约 19s 判定对端死亡）。
+内核默认要 **2 小时**才探测：车机熄火 / 走出热点时链路常不发 RST，读线程会一直挂着——画面冻结、
+会话看门狗不触发。19s 刻意大于车机 15s 的 AirPlay 看门狗，避免我们比车机更早判死正常会话。
+
+CarLife 侧（`CarLifeHuClient`）连的是本机端口，不涉及网络闪断，故不设。
+
+## 验证
+
+- `./gradlew testDebugUnitTest`：**208 用例全绿**（新增 `hardRejectOverturnsSucceededMemory`、
+  `contradictorySuccessAndRejectIsDemotedToNormal`；Cadillac mock 的
+  「禁止消息断言」改为「必须照发断言」`assertUndeclaredFramesStillSent`）。
+- `./gradlew assembleDebug` → `adb install -r` → 启动无崩溃，界面正常，自动连接已按预期进入
+  「蓝牙就绪，等待车机回连…」。
+- **待真车验证**：别克 E2LB 上车看三点——① 日志出现 `车机可收清单未声明 0x4e0d/0x4e0e ……仍照常发送`；
+  ② 断链后不再出现「已有会话在处理中，忽略本次端点」；③ 熄火后画面冻结能在 ~20s 内被判定断链。
