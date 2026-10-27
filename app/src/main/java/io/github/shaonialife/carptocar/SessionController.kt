@@ -43,6 +43,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 进程级会话中枢：**日志缓冲**与**会话管线所有权**的唯一持有者。
@@ -80,6 +81,14 @@ object SessionController {
 
     /** 加入确认弹窗的应答等待上限（无人应答按中止处理）。 */
     private const val JOIN_DIALOG_TIMEOUT_S = 90L
+
+    /**
+     * 空端点（车机声明会发 0x4301 但窗口内未到）的等待上限。
+     *
+     * 奥迪 MMI 9310 实测 0x4301 晚到 2 分 35 秒——保活窗口必须显著长于它；
+     * 超时拆链让 BT 重连循环接管（与旧「8s 拆链」的区别只在窗口长度）。
+     */
+    private const val PENDING_START_SESSION_WAIT_MS = 5 * 60_000L
 
     /**
      * 等车机 ctrl 邀请的上限（事件驱动，收到即走）。
@@ -447,6 +456,29 @@ object SessionController {
     var connectCancelled: Boolean = false
 
     /**
+     * 空端点等待观察者的**代际**：每新起一个就自增，旧观察者看到代际变化即退出。
+     *
+     * 2026-10-26 别克 E2LB 日志：车机每 ~40 秒把链路掐掉一次（收到 0x4300 后停止 ACK，
+     * 我方重传看门狗拆链），每次重连都新起一个观察者而旧的只认 connectCancelled——
+     * 于是 5 轮之后同一时刻有 5 个观察者在跑，日志里同时出现「已等 30s / 61s / 122s /
+     * 153s」，看起来像时间倒流。
+     */
+    private val pendingWatchGeneration = AtomicInteger(0)
+
+    /**
+     * 一次「启动连接」内的等待预算起点（[PENDING_START_SESSION_WAIT_MS] 从这次点击算起）。
+     *
+     * 不能每轮会话重置：车机反复断链重连时，旧实现每轮重新计 5 分钟，等于**永不超时**，
+     * 用户看到的「最多等 5 分钟」是假的，连接会一直原地打转。
+     */
+    @Volatile
+    private var pendingWaitBudgetStartedAt: Long = 0L
+
+    /** 本周期的等待预算已耗尽：后续观察者不再重复拆链/刷日志，等用户重新点「启动连接」。 */
+    @Volatile
+    private var pendingWaitGaveUp: Boolean = false
+
+    /**
      * 当前连接阶段的一句话提示（英雄卡副标题用，详细过程看日志）。
      * 由各阶段显式设置；null 时 UI 显示默认文案。
      */
@@ -463,6 +495,25 @@ object SessionController {
         // 否则英雄卡永久「正在连接」（旧流程产出已被 retireSession 清理，无冲突）
         sessionStarting.set(false)
         phaseHint = "已取消连接"
+    }
+
+    /**
+     * 发送端 BT 链路断开（保活泵退出）。配对进行中（未推流）时本轮已注定失败——
+     * 立即释放「会话处理中」互斥并唤醒卡住的等待。
+     *
+     * 为什么必须做（上游 0.1.14 奥迪 3315 真机定谳，别克 E2LB 同症）：车机 15s 看门狗
+     * 拆链后**立刻回连**并完整重走 Phase 1，新端点却被上一轮还卡在 WiFi 加入里的
+     * 僵尸轮次挡住（「已有会话在处理中」），于是只剩 keep-alive 干等到用户放弃。
+     *
+     * 置 [connectCancelled] 让卡在 WiFi 加入等分片检查的配对线程在 ≤200ms 内退场；
+     * **不停 BT 组件**（车机大概率立刻回连，监听必须留着）。新轮次起步处会清掉本标志。
+     */
+    fun onSenderLinkClosed() {
+        if (videoSender?.isRunning == true) return
+        if (sessionStarting.compareAndSet(true, false)) {
+            connectCancelled = true
+            appendLog(">>> 本轮蓝牙链路断开——释放「会话处理中」，等待车机重连端点接手")
+        }
     }
 
     /**
@@ -530,6 +581,7 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "车机回连") },
                     targetProvider = targetProvider,
                     nowPlayingProvider = nowPlayingProvider,
+                    onLinkClosed = ::onSenderLinkClosed,
                 )
             bluetoothClient =
                 Iap2BluetoothClient(
@@ -540,6 +592,7 @@ object SessionController {
                     onEndpointUpdate = { endpoint -> onLateEndpoint(endpoint, "主动连车机") },
                     targetProvider = targetProvider,
                     nowPlayingProvider = nowPlayingProvider,
+                    onLinkClosed = ::onSenderLinkClosed,
                 )
             ctrlAdvertiser = CarPlayCtrlAdvertiser(context) { line -> appendLog(line) }
             endpointBrowser =
@@ -581,6 +634,9 @@ object SessionController {
      */
     fun startConnection(context: Context) {
         connectCancelled = false
+        // 新一次用户点击 = 新的 5 分钟等待预算（断链重连不再重置，见 pendingWaitBudgetStartedAt）
+        pendingWaitBudgetStartedAt = 0L
+        pendingWaitGaveUp = false
         phaseHint = "蓝牙就绪，等待车机回连…"
         // 新会话 = 新的 NowPlaying 上下文：清去重键，否则同一首歌重连后不会被重推
         resetNowPlayingDedupe()
@@ -1197,6 +1253,101 @@ object SessionController {
     private fun detachActiveBtSessions() {
         bluetoothServer?.detachCurrentSession()
         bluetoothClient?.detachCurrentSession()
+    }
+
+    /**
+     * 空端点等待期（车机声明会发 0x4301 但迟迟未到）的观察任务。
+     *
+     * 1. 每 5s 轮询当前 WiFi——用户手动连上车机热点后弹窗确认，确认即以该 SSID 合成
+     *    端点重走 [onCarPlayEndpoint]（无端口 → mDNS/网关兜底）；
+     * 2. 晚到 0x4301 触发新一轮交接（sessionStarting 重新置位）时让位退出；
+     * 3. 超过 [PENDING_START_SESSION_WAIT_MS] 无进展：记日志并拆掉保活链路，让 BT
+     *    重连循环接管（与旧「8s 拆链」的区别只在窗口长度）。
+     *
+     * 为什么需要第 1 条：GM/Cinemo 这类车机（凯迪拉克 CT5/A2LL 实测）的 0x4301 以
+     * 「车机在 Wi-Fi 上看到手机的 _carplay-ctrl 并邀请」为前提，而它又不下发 0x5703
+     * 凭据——手机进不了它的网络就永远等不到 0x4301。车主在车机上能看到热点名与密码，
+     * 手动连上即可打破死锁；这一步就是把「用户已经连上了」这件事告诉主控。
+     */
+    private fun watchForPendingStartSession(
+        endpoint: Iap2SenderSession.CarPlayEndpoint,
+        source: String,
+    ) {
+        // 代际：新观察者一起，前面所有观察者作废（每次断链重连都会新起一个）。
+        val generation = pendingWatchGeneration.incrementAndGet()
+        Bg.run("pending-start-session-watch") {
+            if (pendingWaitGaveUp) {
+                // 本周期的预算已耗尽，不重复刷日志/重复拆链（旧实现会在此无限循环）。
+                return@run
+            }
+            // 英雄卡副标题同步：否则界面一直显示默认的「蓝牙 iAP2 握手 → …」，
+            // 用户看到的是「一直在握手」，实际早已连上、在等车机下发凭据。
+            phaseHint = "已连上车机，正在等它下发热点信息（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· 请保持 Wi-Fi 开启"
+            appendLog(
+                ">>> [$source] 进入保活等待：车机声明会发 0x4301 但窗口内未到。" +
+                    "蓝牙链路保持（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟，从点「启动连接」算起），" +
+                    "期间请保持手机 Wi-Fi 开启；车机多数要看到手机进入它自己的网络后才会下发凭据",
+            )
+            var promptedSsid: String? = null
+            // 预算从**用户点击**算起：车机反复断链重连时不能每轮重新计 5 分钟（否则永不超时）。
+            if (pendingWaitBudgetStartedAt == 0L) pendingWaitBudgetStartedAt = android.os.SystemClock.uptimeMillis()
+            val watchStartedAt = pendingWaitBudgetStartedAt
+            val deadline = watchStartedAt + PENDING_START_SESSION_WAIT_MS
+            var tick = 0
+            while (!connectCancelled && android.os.SystemClock.uptimeMillis() < deadline) {
+                Thread.sleep(5_000)
+                tick++
+                if (connectCancelled) return@run
+                if (pendingWatchGeneration.get() != generation) return@run
+                // 晚到 0x4301 已触发新一轮交接——观察任务让位。
+                if (sessionStarting.get()) return@run
+                val (wifiEnabled, currentSsid) = shellWifiStatus()
+                // 每 30s 落一行：没有它，等待期在日志里只剩车机心跳，用户/排查都看不出在等什么。
+                if (tick % 6 == 0) {
+                    val waited = (android.os.SystemClock.uptimeMillis() - watchStartedAt) / 1_000
+                    appendLog(
+                        ">>> [$source] 仍在等 0x4301（已等 ${waited}s · 上限 " +
+                            "${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· Wi-Fi=" +
+                            when {
+                                !wifiEnabled -> "已关闭（请打开——车机看不到手机就不会下发凭据）"
+                                currentSsid.isNullOrEmpty() -> "已开但未连接任何网络"
+                                else -> "\"$currentSsid\""
+                            },
+                    )
+                }
+                val ssid = if (wifiEnabled) currentSsid else null
+                // 同一 SSID 只问一次（用户选「继续等待」后不再打扰）；换网络再问。
+                if (ssid.isNullOrEmpty() || promptedSsid == ssid) continue
+                promptedSsid = ssid
+                val choice =
+                    askWifiJoinChoice(
+                        DialogSpec(
+                            title = "检测到已连接 $ssid",
+                            message =
+                                "车机尚未经蓝牙下发连接信息（0x4301）。是否把当前网络 \"$ssid\" 当车机热点，" +
+                                    "直接尝试 mDNS/网关连接？（点「继续等待」则保持蓝牙保活等车机下发）",
+                            positive = "按车机热点继续",
+                            negative = "继续等待",
+                        ),
+                    )
+                if (choice == true && !connectCancelled && !sessionStarting.get()) {
+                    appendLog(">>> [$source] 用户确认当前网络 \"$ssid\" 为车机热点——以合成端点重走连接")
+                    onCarPlayEndpoint(endpoint.copy(ssid = ssid), "$source/手动入网")
+                    return@run
+                }
+            }
+            if (!connectCancelled && !sessionStarting.get() && pendingWatchGeneration.get() == generation) {
+                pendingWaitGaveUp = true
+                phaseHint = "车机未下发热点信息（0x4301），本轮已停止重试"
+                appendLog(
+                    ">>> [$source] 空端点等待 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟超时——" +
+                        "车机始终未下发 0x4301（0x4300 各种报文体都试过了，见上方「0x4300 报文体形态」与" +
+                        "「⚠ 零反馈」两行）。先拆掉保活链路停止空转；确认车机开了无线 CarPlay 后再点" +
+                        "「启动连接」，并把日志发出来",
+                )
+                detachActiveBtSessions()
+            }
+        }
     }
 
     /**
@@ -1855,9 +2006,29 @@ object SessionController {
             appendLog(">>> [$source] 已有会话在处理中，忽略本次端点（等待上一轮结束）")
             return
         }
+        // 新轮次起步清取消标志：上一轮可能因「BT 链路断开」置位退出（见
+        // onSenderLinkClosed）——能走到这里说明 BT 组件仍在运行（用户取消路径会
+        // 停组件、被上方守卫拦截），该标志属于已退场的旧轮次，不清会误伤本轮。
+        connectCancelled = false
         // 新一轮交接开始：清掉上一轮（可能中途失败）遗留的晚到端点暂存，
         // 否则它会在本轮的 drain 阶段覆盖掉本会话刚解析出的端点。
         pendingEndpointUpdate = null
+        // 空端点 = 新协议车机（GM/Cinemo 等）声明会发 0x4301 但窗口内未到。
+        // Iap2SenderSession 已不再为此拆链，保活泵会把晚到的 0x4301 经 onLateEndpoint
+        // 送回本函数重走完整流程。这里**不占 sessionStarting**（晚到端点要走「上一轮
+        // 已结束」分支），改为进入等待态：期间轮询手机 WiFi，用户手动连上车机热点
+        // （密码在车机设置里可见，凯迪拉克 CT5 实测）后确认即可用该 SSID 合成端点，
+        // 走 mDNS/网关兜底路径；超时再拆链让重连循环接管。
+        if (endpoint.ssid.isEmpty()) {
+            appendLog(
+                ">>> [$source] 端点无 AP 信息（车机未在窗口内下发 0x4301）——蓝牙保持保活等待晚到 0x4301；" +
+                    "检测到手机已连 WiFi 时会询问是否按车机热点继续",
+            )
+            phaseHint = "等待车机下发连接信息（0x4301）…"
+            sessionStarting.set(false)
+            watchForPendingStartSession(endpoint, source)
+            return
+        }
         appendLog(
             ">>> [$source] 拿到接收端热点：SSID=${endpoint.ssid}；" +
                 "密码=${if (endpoint.passphrase.isEmpty()) "(空)" else "已获取"}",

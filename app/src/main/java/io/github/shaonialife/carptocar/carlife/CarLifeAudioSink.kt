@@ -17,6 +17,15 @@ import io.github.shaonialife.carptocar.audio.AudioSender
  */
 internal class CarLifeAudioSink(
     private val log: (String) -> Unit,
+    /**
+     * 是否参与「音乐会话暂停 → 丢弃残留 PCM」的联动。
+     *
+     * 媒体通道（9240）用 true：音乐 App 暂停后引擎仍会把排队 PCM 推完，不丢会重复播放。
+     * **TTS 通道（9241）必须用 false**：导航播报恰恰多发生在没放音乐 / 音乐被暂停的时候，
+     * 一旦套用这条联动，整段播报会被当成「残留」吃掉——这是「开导航没声音」的另一半原因
+     * （2026-10-27 日志：10:35:04 刚触发暂停丢弃，10:35:14 的导航 TTS 就来了）。
+     */
+    private val dropWhenPaused: Boolean = true,
 ) {
     /** CarLife 引擎宣告的源采样率（CarlifeMusicInit；<=0 表示尚未宣告，按 48k 处理）。 */
     @Volatile
@@ -130,7 +139,7 @@ internal class CarLifeAudioSink(
         if (size <= 0) return
         // 音乐会话暂停后的一小段窗口内：丢弃引擎仍在推的残留 PCM（避免重复播放）
         val now = android.os.SystemClock.uptimeMillis()
-        if (shouldDropPaused(now)) {
+        if (dropWhenPaused && shouldDropPaused(now)) {
             countDroppedWhenPaused()
             return
         }
@@ -255,5 +264,8 @@ internal fun carLifeAudioTypeName(type: Int): String =
         CarLifeProtocol.MUSIC_PKG_START -> "开始"
         CarLifeProtocol.MUSIC_PKG_STOP -> "停止"
         CarLifeProtocol.MUSIC_PKG_NORMAL -> "PCM"
+        CarLifeProtocol.TTS_PKG_INIT -> "TTS-INIT"
+        0x40002 -> "TTS-开始"
+        0x40003 -> "TTS-PCM"
         else -> "0x%X".format(type)
     }

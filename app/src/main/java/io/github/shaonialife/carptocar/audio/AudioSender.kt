@@ -384,6 +384,14 @@ class AudioSender(
      * @param srcRate  输入采样率（<=0 时按 [sampleRate] 处理，不重采样）
      * @param srcChannels 输入声道数（1 或 2；其它按 2 处理）
      */
+    /**
+     * 外部注入 PCM（CarLife 直通）。
+     *
+     * **必须同步**：媒体（9240）与 TTS（9241）是两条独立读线程，2026-10-27 接入导航播报
+     * 后两路会同时进来；[passthroughBuffer] 是非线程安全的 ByteArrayOutputStream，
+     * 不加锁会出现半帧交错（爆音/破音）甚至丢数据。
+     */
+    @Synchronized
     fun feedPcm(
         srcPcm: ByteArray,
         size: Int,

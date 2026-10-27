@@ -20,6 +20,8 @@ internal fun Iap2LinkChannel.runSenderSession(
     onEndpointUpdate: (Iap2SenderSession.CarPlayEndpoint) -> Unit,
     nowPlayingProvider: (() -> CarPlayNowPlaying?)? = null,
     onSessionReady: (Iap2SenderSession) -> Unit = {},
+    /** 保活泵退出（链路断开）回调——用于释放主控的「会话处理中」互斥，见调用处注释。 */
+    onLinkClosed: () -> Unit = {},
 ) {
     val session =
         Iap2SenderSession(
@@ -38,6 +40,10 @@ internal fun Iap2LinkChannel.runSenderSession(
     // Phase 2 过渡：保持控制通道存活记录配件消息；AirPlay 配对由 onEndpoint 回调发起
     onSessionReady(session)
     session.pumpIncomingForever()
+    // 链路断开（保活泵退出）：通知主控释放「会话处理中」——否则车机拆链后立刻回连
+    // 带来的新端点会被**僵尸轮次**堵门：车机 15s 看门狗 + 我方 WiFi 加入长等待的
+    // 窗口错配，让新端点只能干等到用户放弃（上游 0.1.14 奥迪 3315 真机定谳）。
+    onLinkClosed()
 }
 
 /**

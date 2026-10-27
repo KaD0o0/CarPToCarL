@@ -163,6 +163,21 @@ internal object CarLifeProtocol {
     const val MUSIC_PKG_STOP = 0x30003
     const val MUSIC_PKG_NORMAL = 0x30006
 
+    // ---- TTS（9241 端口）：导航播报 / 语音提示 ----
+    //
+    // 关键：**这条通道才是导航声音的来源**，与媒体通道（9240 / 0x3xxxx）完全独立。
+    // 2026-10-27 真机日志（WinPlay 测试台）实测：
+    //   0x40001 长度 7    → 格式宣告（CarlifeMusicInit 同构）
+    //   0x40002 长度 0    → 开始
+    //   0x40003 长度 1280 → **裸 PCM（导航播报数据）**
+    // 编号与媒体通道**不对应**（媒体数据包是 0x30006，TTS 却在 0x40003 上带负载），
+    // 所以这里不照搬编号做枚举，只认两条铁律：**有负载就是 PCM，长度 0 就是开停信号**。
+    // 旧实现把 0x4xxxx 全丢进「暂不处理」，症状正是「音乐有声、地图导航没声」。
+    const val TTS_PKG_INIT = 0x40001
+
+    /** TTS 未宣告格式时的兜底采样率（导航播报常见 16k 单声道，AudioSender 会重采样到 48k）。 */
+    const val TTS_DEFAULT_RATE = 16_000
+
     // ---- 帧格式 ----
 
     /** 控制通道（Channel 1）：[u16 len][u16 reserved][u32 service_type] */

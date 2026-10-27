@@ -2142,6 +2142,10 @@ class AirPlayClient(
             socket.connect(InetSocketAddress(resolveAddress(host), setup.eventPort), 5_000)
             socket.tcpNoDelay = true
             socket.soTimeout = 30_000
+            // 2026-10-27 回退：控制/事件通道**不再**设 keepalive / TCP_USER_TIMEOUT。
+            // 用户报「1.0.11 后车机导航播报无声」——音频数据面虽走独立 UDP，但音频 SETUP、
+            // SET_PARAMETER(volume)、feedback 心跳全走这条控制通道，先在 socket 级把变量
+            // 收回到与 1.0.10 完全一致的行为（视频数据口的 keepalive 保留，与音频无关）。
             log("EVENT: ✓ 已连接事件通道 $host:${setup.eventPort}（${if (sessionKey != null) "加密" else "明文"}）")
             val cipher =
                 sessionKey?.let { secret ->
@@ -2353,6 +2357,9 @@ class AirPlayClient(
                 // 读由独立读线程负责（阻塞等数据），请求超时由待响应表的 poll 控制；
                 // 这里若留 soTimeout，读线程会周期性收到 SocketTimeoutException 而退出
                 newSocket.soTimeout = 0
+                // 2026-10-27 回退：控制通道保持「只做 TCP 连接、不加内核级超时」的原状
+                // （见事件通道同处注释）。音频 UDP 的 dataPort/controlPort 都是由这条通道
+                // 协商出来的，先排除 socket 级改动对音频通路建立的任何影响。
                 socket = newSocket
                 activeAddress = address
                 activeHost = addressLiteral(address)

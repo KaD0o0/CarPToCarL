@@ -71,6 +71,40 @@ class MfiLengthMemoryTest {
         assertEquals(order.size, order.distinct().size)
     }
 
+    /**
+     * 硬拒绝推翻「成功」记忆（上游 0.1.23 定谳的迟到应答污染）：
+     * 32B 的迟到应答被记到 20B 头上 → 之后每轮 20B 都被对端断链。
+     * 断链是强证据，必须把 20B 从成功档位摘掉、记进被拒档。
+     */
+    @Test
+    fun hardRejectOverturnsSucceededMemory() {
+        val identity = "hard-reject-test-car"
+        // 先记成「20B 成功」（模拟迟到应答误记）
+        MfiLengthMemory.recordSuccess(null, identity, 20)
+        assertEquals(20, MfiLengthMemory.load(null, identity).succeeded)
+        // 挑战期间被对端断链 → 硬拒绝必须推翻它
+        MfiLengthMemory.recordHardRejected(null, identity, 20)
+        val next = MfiLengthMemory.load(null, identity)
+        assertEquals(null, next.succeeded)
+        assertTrue(20 in next.rejected)
+        assertFalse(20 in next.silent)
+        // 摘掉之后 20B 不再排第一：真车基线 [20,32,16] → 先试 32
+        assertEquals(listOf(32, 16, 20), MfiLengthMemory.orderAttempts(baselineCar, next))
+    }
+
+    /**
+     * 「成功 ∧ 被拒」自相矛盾的记忆：不能继续享受第一名，降级为普通档参与排序
+     * （排在被拒档之前，仍会被试到），避免旧实现那种「每轮都先撞必断链的档位」。
+     */
+    @Test
+    fun contradictorySuccessAndRejectIsDemotedToNormal() {
+        val entry = MfiLengthMemory.Entry(succeeded = 20, rejected = setOf(20))
+        val order = MfiLengthMemory.orderAttempts(baselineCar, entry)
+        assertEquals(listOf(32, 16, 20), order)
+        // 不丢档位：20B 只是被降级，仍然会被尝试（万一固件又变回来）
+        assertEquals(baselineCar.toSet(), order.toSet())
+    }
+
     @Test
     fun describeShowsWhatWasRemembered() {
         assertEquals("无", MfiLengthMemory.describe(MfiLengthMemory.Entry()))

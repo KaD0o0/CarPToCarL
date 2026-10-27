@@ -7,6 +7,7 @@ import android.view.Surface
 import io.github.shaonialife.carptocar.airplay.AirPlayCrypto
 import io.github.shaonialife.carptocar.airplay.BinaryPlist
 import io.github.shaonialife.carptocar.airplay.StreamFrameCipher
+import io.github.shaonialife.carptocar.net.TcpLiveness
 import java.io.ByteArrayOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -177,6 +178,9 @@ class VideoSender(
             val client = Socket()
             client.connect(InetSocketAddress(host, dataPort), 5_000)
             client.tcpNoDelay = true
+            // 视频口是单向长写：对端静默消失时写窗口会一直「写成功」直到内核缓冲填满，
+            // keepalive 让断链在 ~19s 内可见（进而触发 [reconnectDataPort] 的 8s 窗口补救）
+            TcpLiveness.configure(client, "视频数据口", log)
             socket = client
             log("VIDEO: 数据端口已连通 $host:$dataPort（等 RECORD 后启动编码器）")
             true
@@ -219,6 +223,7 @@ class VideoSender(
                     val client = Socket()
                     client.connect(InetSocketAddress(host, dataPort), 2_000)
                     client.tcpNoDelay = true
+                    TcpLiveness.configure(client, "视频数据口(重连)", log)
                     socket = client
                     log("VIDEO: 视频通道已重连（第 $attempt 次）——重发 VideoConfig，等下一个 IDR")
                     return true

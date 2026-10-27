@@ -102,8 +102,53 @@ class Iap2SenderSession(
     /** 0x4301 原始体是否已记录（每轮会话一次，避免周期补发刷屏）。 */
     private var startSessionRawLogged = false
 
+    /** 0x1D01 得到的车机身份文本——[AvailabilityBodyMemory] 的键（空 = 还没识别）。 */
+    private var receiverIdentity: String = ""
+
+    /**
+     * 本轮 0x4300 用的报文体形态。
+     *
+     * null = 不启用试错阶梯（没有 Context：单测/纯 JVM），一律用新版嵌套体，行为与
+     * 改动前一致。真机有 Context 时由 [AvailabilityBodyMemory.nextVariant] 决定。
+     */
+    private var availabilityVariant: AvailabilityBodyMemory.Variant? = null
+
     /** 最近一次晚到 0x4301 的端点指纹（车机周期重发相同内容时不重复打详情）。 */
     private var lastLateStartSessionSignature: Int? = null
+
+    /**
+     * 是否处于「已进入保活、正等车机下发 0x4301」的等待态。
+     *
+     * 为真时保活泵改用短超时轮询，并每隔 [NUDGE_INTERVAL_MILLIS] 重发一次
+     * `0x4e0e`（传输标识）+ `0x4300`（CarPlay 可用性）「催问」车机。
+     * 依据：凯迪拉克 CADILLAC_7731（Cinemo 栈）声明了 11 条消息——含 0x4301、
+     * 0x6800、0x4c00、0x5000——却**一条都没主动发起**，只对我们的包回 ACK。
+     * 这种「只应答不发起」的形态很像在等前置消息；而 0x4E0E 此前要等 8 秒窗口
+     * 过期后才发，若车机正是等它，顺序就错了。
+     */
+    @Volatile
+    private var awaitingStartSession = false
+
+    /** 已催问次数（用于限次与日志节流）。 */
+    @Volatile
+    private var nudgeCount = 0
+
+    /** 上次催问时间戳（毫秒）。 */
+    @Volatile
+    private var lastNudgeAt = 0L
+
+    /**
+     * 上次催问（或发 0x4300）时的对端控制帧计数，用来判断车机是否还在处理我们的帧。
+     *
+     * 2026-10-26 别克 E2LB 日志：车机 ACK 到 0x4e0c 后彻底停摆（只在 RFCOMM 上每秒发
+     * 6 字节封装心跳），而我们的催问会**再补一轮 ACK 待确认的问候**——看门狗 23 秒后
+     * `packet 111 not acknowledged` 拆链，5 分钟保活被切成 42 秒一轮的死循环。
+     * 也就是说：**催问本身就是拆链元凶**。计数没涨 = 车机不处理，就别再喂。
+     */
+    private var lastNudgePeerFrames = -1
+
+    /** 静默期跳过催问的次数（日志节流）。 */
+    private var silentNudgeSkips = 0
 
     /**
      * 0x1D01 参数 6：车机声明「它可发送」的消息 ID 清单。
@@ -118,11 +163,49 @@ class Iap2SenderSession(
     /** 识别帧是否真的带了接收清单（空清单与「未提供」必须区分）。 */
     private var receiveListDeclared = false
 
+    /**
+     * WiFi 凭据交换的代际判定（[ReceiverProfile.classify] 的结果，0x1D01 到达时算一次）。
+     *
+     * 分派**只认它**，不再用「可收清单里有没有 0x5702」直接判：奥迪 3315 的清单
+     * 只列 5 项、不含 0x5702，但它完整支持 0x5702→0x5703，而且**要靠收到 0x5702
+     * 才把 AirPlay 服务拉起来**——按清单硬拦会走进「7000 端口全程 ECONNREFUSED」
+     * 的死局（上游 0.1.13 实测，2026-10-22 定谳）。只有 NEW（两清单合计 ≥10 项
+     * 仍无 0x57xx，宝马 iD9 形态）才跳过旧协议。
+     */
+    private var wifiGen: ReceiverProfile.WifiGen = ReceiverProfile.WifiGen.UNKNOWN
+
     /** 车机是否声明会发某消息；null = 未提供清单（未知，按保守策略等待）。 */
     private fun accessoryDeclaresSend(messageId: Int): Boolean? = if (accessorySendIds.isEmpty()) null else messageId in accessorySendIds
 
     /** 车机是否声明能收某消息；null = 未提供清单（未知，按保守策略继续）。 */
     private fun accessoryDeclaresReceive(messageId: Int): Boolean? = if (!receiveListDeclared) null else messageId in accessoryReceiveIds
+
+    /** 「车机没声明能收」的日志去重：同一消息 ID 每轮会话只记一次（催问会反复触发）。 */
+    private val undeclaredReceiveLogged = HashSet<Int>()
+
+    /**
+     * 可选消息「车机没声明能收」的**记录**（只记不发拦截，2026-10-27 修正）。
+     *
+     * 曾经的实现（1.0.8 起）把 0x1D01 参数 7 当硬门禁：清单里没有 `0x4E0D`/`0x4E0E`
+     * 就真的不发。上游 cardeck 0.1.28 的真车证据推翻了这条判据——
+     * 奥迪 3315 的可收清单只有 5 项、不含 `0x5702`，但它完整支持 `0x5702→0x5703`；
+     * 同一天的日志里 `0x4e0d/0x4e0b/0x4e0e` 三条不在清单里，车机逐条 ACK 到位。
+     * 结论：**清单只能证明「有」，不能证明「没有」**。
+     *
+     * 别克 E2LB 的日志同样证明裁剪没有换来推进（裁掉之后仍是 ACK 后沉默），
+     * 所以这里退回「只记录」：帧照发，日志留证，将来对某台车复现时还能看出
+     * 它到底声明了什么。
+     */
+    private fun recordUndeclaredReceive(messageId: Int) {
+        if (accessoryDeclaresReceive(messageId) != false) return
+        if (undeclaredReceiveLogged.add(messageId)) {
+            log(
+                "iap2 车机可收清单未声明 0x${messageId.toString(16).padStart(4, '0')} " +
+                    "(${Iap2MessageIds.nameOf(messageId)}) reason=accessory-did-not-advertise" +
+                    "—— 仍照常发送（清单只能证明「有」不能证明「没有」，见上游 0.1.28 奥迪定谳）",
+            )
+        }
+    }
 
     private companion object {
         /** 等 StartHID 的窗口：xcertplay 会发（订阅后立即到），DiPlay 不发。 */
@@ -144,6 +227,15 @@ class Iap2SenderSession(
 
         /** 0x4301 原始体日志上限（Audi 实测 261B，完整记录；异常大的只截前段）。 */
         const val START_SESSION_RAW_LOG_BYTES = 1_024
+
+        /** 等待 0x4301 时保活泵的轮询间隔（也是催问的最小检查粒度）。 */
+        const val NUDGE_TICK_MILLIS = 5_000L
+
+        /** 催问间隔：太密会像洪水把车机打懵，太疏则复测一轮耗时长。 */
+        const val NUDGE_INTERVAL_MILLIS = 15_000L
+
+        /** 催问上限（20 × 15s = 5 分钟，与主控的空端点等待窗口一致）。 */
+        const val NUDGE_MAX_TIMES = 20
 
         /**
          * 已知「静默过」的档位重试窗口。首次试探保留原窗口（可能是慢车机），
@@ -188,6 +280,18 @@ class Iap2SenderSession(
 
         // ---- MFi（跳过校验：0xAA05 自报成功）----
         val identityText = identityText(identification)
+        // 0x4300 报文体形态的按车机试错记忆（见 AvailabilityBodyMemory 文档：
+        // 别克 E2LB 收到新版嵌套体后控制会话直接停摆）。无 Context（单测）时固定新版。
+        receiverIdentity = identityText
+        // 只有真机（有 Context，可持久化）才启用阶梯；单测/纯 JVM 固定新版嵌套体，
+        // 协议时序与改动前完全一致（也让用例之间不会通过进程内记忆互相污染）。
+        availabilityVariant = if (context == null) null else AvailabilityBodyMemory.nextVariant(context, identityText)
+        availabilityVariant?.let {
+            log(
+                "iap2 0x4300 报文体形态：${it.label}" +
+                    "（该车机历史静默档=${AvailabilityBodyMemory.silentDescription(context, identityText)}）",
+            )
+        }
         val legacyCar = LEGACY_RECEIVER_MARKERS.any { identityText.contains(it) }
         if (legacyCar) {
             log("iap2 识别为真车系（$identityText）——MFi 首选 20B（真 iPhone 实录长度；32B 对真车处置不稳定）")
@@ -206,13 +310,21 @@ class Iap2SenderSession(
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 authentication-succeeded（自报）")
 
+        // ---- 设备状态问候：**紧跟 0xAA05**（上游 PR #17 / BMW iD8.5 实测）----
+        // 车机据这批消息判定「发送端已就绪」，晚发会被当成还没起来。旧实现把它们
+        // 排在 awaitOptionalHid（最多 2s）之后，等于让车机多等 2 秒——凯迪拉克日志里
+        // 0xaa05 在 33.248、问候在 35.249，中间空了 2 秒正是那段 HID 等待。
+        sendDeviceStateGreetings()
+
         // ---- EA 会话启动（MFi 认证完成后）----
         // 奥迪 0x1D01 声明 de.audi.mmicconnectdatatransfer / com.audi.cpp.eadata0/1
         // 三个 EA 协议；触摸 HID 相关数据经 EA 会话。认证前发送会噎死 DiPlay（见上）。
         for ((protocolId, name) in eaProtocols) {
             sendFireAndForget(
                 Iap2MessageIds.EA_OPEN_SESSION,
-                Iap2Csm.u8(0, protocolId) + Iap2Csm.u16(1, protocolId),
+                // param 1 = EA 协议名（UTF-8 字符串）。发成协议号时车机不回 0xEA03
+                // （上游 PR #17 实测修正）。
+                Iap2Csm.u8(0, protocolId) + Iap2Csm.string(1, name),
             )
             log("iap2 tx=0xea00 startEASession protocol=$protocolId name=$name")
         }
@@ -228,15 +340,17 @@ class Iap2SenderSession(
         // WirelessCarPlayParams），BMW iD9 走这条——它在 0x1D01 里既不声明能收 0x5702，
         // 也不声明会发 0x5703。旧流程对这类车机会在 0x5703 上死等 10 秒后拆链
         // （2026-10-19 BMW92438 实车日志：每轮都是「等待 0x5703 超时」）。
-        // 因此按车机声明的能力清单分派：不支持旧协议就直接跳到 0x4300/0x4301。
+        // 因此按车机画像（[ReceiverProfile.wifiGen]）分派，**不是**按「清单里有没有
+        // 0x5702」：清单只能证明「有」，不能证明「没有」（上游 0.1.28 奥迪 3315 定谳，
+        // 别克 E2LB 日志同证）。只有 NEW 才跳过旧协议，LEGACY/UNKNOWN 一律发。
         val declaresReceiveWifi =
             accessoryDeclaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
         val declaresSendWifi = accessoryDeclaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
-        val legacyWifiExchange = declaresReceiveWifi != false && declaresSendWifi != false
+        val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
         val wifiFromExchange: WifiConfiguration? =
             if (!legacyWifiExchange) {
                 log(
-                    "iap2 车机未声明支持 0x5702/0x5703（收=${declaresReceiveWifi ?: "未知"} " +
+                    "iap2 画像判 wifiGen=NEW（两清单完整仍无 0x57xx，收=${declaresReceiveWifi ?: "未知"} " +
                         "发=${declaresSendWifi ?: "未知"}）——跳过旧协议，AP 信息由 0x4301 提供",
                 )
                 null
@@ -260,30 +374,9 @@ class Iap2SenderSession(
                 }
             }
 
-        // ---- 设备状态问候（对照真 iPhone 实录：0x4E0D/0x4E0A/0x4E09/0x4E0B → 0x4300）----
+        // ---- 设备状态问候（已在 0xAA05 之后立即发过，这里幂等空转）----
         // Audi MIB3 实测：缺这批消息时，车机对 0x4300 只回链路 ACK、不出 0x4301。
-        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
-        send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
-        send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
-        val epochSeconds = System.currentTimeMillis() / 1000L
-        val timezoneMinutes =
-            java.util.TimeZone
-                .getDefault()
-                .getOffset(System.currentTimeMillis()) / 60_000
-        send(
-            Iap2MessageIds.DEVICE_TIME_UPDATE,
-            Iap2Csm.param(0, u64Bytes(epochSeconds)) +
-                Iap2Csm.u16(1, timezoneMinutes and 0xFFFF) +
-                Iap2Csm.u8(2, 0),
-        )
-        send(
-            Iap2MessageIds.DEVICE_UUID_UPDATE,
-            Iap2Csm.string(0, deviceUuid()),
-        )
-        log(
-            "iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
-                "（name=$deviceName mac=$bluetoothMac）",
-        )
+        sendDeviceStateGreetings()
 
         // ---- CarPlay 会话启动 ----
         // 两种对端形态：
@@ -293,10 +386,12 @@ class Iap2SenderSession(
         //    超时返回无端点的 CarPlayEndpoint，由主控 mDNS 合成。
         // 0x4300 同样发后不管：2026-10-11 12:52 轮实测车机曾对它停止 ACK
         // （事件通道 SYN 洪水把它打懵的时段），链路看门狗险些再次自杀。
-        sendFireAndForget(
-            Iap2MessageIds.CARPLAY_AVAILABILITY,
-            Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
-        )
+        // 发之前记一次对端控制帧计数：别克 E2LB 实测它收到这一帧后就**彻底不再 ACK**，
+        // 用这个计数把「对端还在不在处理我们的帧」量出来（见下方 noteAvailabilitySilence）。
+        val framesBeforeAvailability = channel.peerFrameCount
+        // 催问的静默基线也钉在这一刻：第一次催问（+15s）就能判断车机是否还在回帧。
+        lastNudgePeerFrames = framesBeforeAvailability
+        sendAvailability()
         // 车机声明里没有 0x4301 就直接跳过等待（Audi 实测每轮白等 10s）：
         // 真 iPhone 对这类车机也不等——AirPlay 端点经 mDNS/网关合成。
         val declaresStartSession = accessoryDeclaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
@@ -316,6 +411,13 @@ class Iap2SenderSession(
                     minOf(deadline, System.nanoTime() + startSessionWindow),
                 )
         }
+        // 静默判定只在这条路上有意义：新协议车机（没有 0x5703）+ 声明会发 0x4301 + 没等到。
+        // 老协议车机（Audi 等）对 0x4300 的处置不影响后续流程，不做阶梯，避免回归。
+        if (startSession == null && declaresStartSession == true && wifiFromExchange == null) {
+            noteAvailabilitySilence(framesBeforeAvailability, startSessionWindow)
+        } else if (startSession != null) {
+            availabilityVariant?.let { AvailabilityBodyMemory.recordSuccess(context, receiverIdentity, it) }
+        }
         val endpoint =
             if (startSession != null) {
                 parseStartSession(startSession, wifiFromExchange)
@@ -333,20 +435,56 @@ class Iap2SenderSession(
                     },
                 )
                 if (wifiFromExchange == null) {
-                    // 既没有 0x5703、也没有 0x4301 = 一点 AP 信息都没有，继续等只会空转。
-                    throw IOException("未拿到车机热点凭据：该车机既不支持 0x5703，0x4301 也未提供 AP 信息")
+                    // 无 0x5703。分两种情况，前一种不拆链：
+                    if (declaresStartSession == true) {
+                        // 新协议车机（GM/Cinemo、BMW iD9 同族：无 0x5702/0x5703，AP 信息只在
+                        // 0x4301 里）声明会发 0x4301，但窗口内未到。凯迪拉克 CT5 实测
+                        // （2026-10-21 日志，对应上游 PR #19）：8s 窗口全空，旧逻辑拆链重连，
+                        // 6 轮循环车机始终静默、车机屏「无法连接到 CarPlay 请重试」；
+                        // 而真 iPhone 忘掉热点后仍能无线连上——说明车机会经蓝牙把凭据推下来，
+                        // 只是晚发或等前置条件（奥迪 MMI 9310 先例：Phase 1 结束后 2 分 35 秒才发）。
+                        // **不拆链**：返回空端点让主控进入等待态，晚到的 0x4301 由保活泵经
+                        // handleLateStartSession → onEndpointUpdate 重新触发配对。
+                        log(
+                            "iap2 0x4301 窗口内未到但车机声明会发——不拆链，返回空端点进入保活；" +
+                                "晚到 0x4301 将重新触发配对（Audi MMI 9310 先例：2 分 35 秒）",
+                        )
+                        // 进入「催问」模式：保活泵会周期性重发 0x4e0e + 0x4300。
+                        // 依据 2026-10-26 凯迪拉克日志——车机声明了 11 条消息（含 0x4301/0x6800/
+                        // 0x4c00/0x5000）却**一条都没主动发起**，只回 ACK，像是卡在等某个前置消息。
+                        // 0x4E0E（传输标识）此前要等 8s 窗口过期后才发，若车机正是等它，顺序就错了。
+                        awaitingStartSession = true
+                        CarPlayEndpoint(
+                            ssid = "",
+                            passphrase = "",
+                            channel = 0,
+                            securityType = 0,
+                            airPlayPort = 0,
+                            deviceIdentifier = null,
+                            publicKey = null,
+                            sourceVersion = null,
+                            ipAddresses = emptyList(),
+                        )
+                    } else {
+                        // 一点线索都没有（车机也没承诺会发 0x4301），继续等只会空转。
+                        throw IOException(
+                            "未拿到车机热点凭据：本轮 0x5702/0x4301 都没给出 AP 信息，" +
+                                "且车机没有声明会发 0x4301（请先在车机上重新选择本机）",
+                        )
+                    }
+                } else {
+                    CarPlayEndpoint(
+                        ssid = wifiFromExchange.ssid,
+                        passphrase = wifiFromExchange.passphrase,
+                        channel = wifiFromExchange.channel,
+                        securityType = wifiFromExchange.securityType,
+                        airPlayPort = 0,
+                        deviceIdentifier = null,
+                        publicKey = null,
+                        sourceVersion = null,
+                        ipAddresses = emptyList(),
+                    )
                 }
-                CarPlayEndpoint(
-                    ssid = wifiFromExchange.ssid,
-                    passphrase = wifiFromExchange.passphrase,
-                    channel = wifiFromExchange.channel,
-                    securityType = wifiFromExchange.securityType,
-                    airPlayPort = 0,
-                    deviceIdentifier = null,
-                    publicKey = null,
-                    sourceVersion = null,
-                    ipAddresses = emptyList(),
-                )
             }
         if (startSession != null) {
             logStartSessionRaw(startSession)
@@ -360,22 +498,29 @@ class Iap2SenderSession(
         // 真机顺序：0x4301 之后回 0x4E0E（传输标识确认）。
         // Audi 实测：车机对该消息**接受但从不 ACK**（其余包毫秒级 ACK）——必须发后不管，
         // 否则重传看门狗在 +20s 把整条蓝牙链路杀掉（EA 会话/触摸载体随之丢失）。
+        // 车机可收清单里没声明也照发（只记录，见 [recordUndeclaredReceive]）。
+        recordUndeclaredReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
         sendFireAndForget(
             Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
             Iap2Csm.string(0, bluetoothMac),
         )
-        log("iap2 0x4e0d/0x4e0e/0x4300 —— Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点")
+        log("iap2 0x4e0e/0x4300 —— Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点")
 
         // 后续（Phase 2）：加入热点 → mDNS 解析 _airplay._tcp → AirPlay 主会话。
         // 0x5703 缺席时 AP 信息来自 0x4301（已并入 endpoint）——保活期车机重发
         // 0x5703/0x4301 都要用它解析，不能留空。
-        this.wifi =
-            wifiFromExchange ?: WifiConfiguration(
-                ssid = endpoint.ssid,
-                passphrase = endpoint.passphrase,
-                channel = endpoint.channel,
-                securityType = endpoint.securityType,
-            )
+        // 空端点（声明会发 0x4301 但窗口内未到）必须保持 wifi=null：否则保活期
+        // parseStartSession 的 `ap = wifi ?: fromSession` 会用空凭据覆盖晚到 0x4301
+        // 自带的 AP 信息，把唯一的凭据来源丢掉。
+        if (endpoint.ssid.isNotEmpty()) {
+            this.wifi =
+                wifiFromExchange ?: WifiConfiguration(
+                    ssid = endpoint.ssid,
+                    passphrase = endpoint.passphrase,
+                    channel = endpoint.channel,
+                    securityType = endpoint.securityType,
+                )
+        }
         return endpoint
     }
 
@@ -385,15 +530,20 @@ class Iap2SenderSession(
      * 真实无线 CarPlay 中这条控制通道与 AirPlay 会话并存于整个连接生命周期。
      */
     fun pumpIncomingForever() {
-        log("SESSION 保活中（链路保持打开，持续记录配件消息）")
+        log(
+            "SESSION 保活中（链路保持打开，持续记录配件消息）" +
+                if (awaitingStartSession) "——车机尚未下发 0x4301，将每 ${NUDGE_INTERVAL_MILLIS / 1000}s 催问一次" else "",
+        )
         // 同一消息 ID 连续到达时限流：车机进入媒体播放后会周期性发 NowPlaying 更新，
         // 逐条打日志会把文件日志撑爆（文件超 2MB 直接删，等于丢掉真正有用的上下文）。
         var lastLoggedId = -1
         var repeatCount = 0
         while (true) {
-            val frame = recvFrame(30_000L)
+            // 等待态用短超时：`recvFrame` 阻塞期间没法催问，只能靠「空转一次就检查一次」。
+            val frame = recvFrame(if (awaitingStartSession) NUDGE_TICK_MILLIS else 30_000L)
             if (frame == null) {
                 if (!channel.isAlive) break
+                if (awaitingStartSession) nudgeIfDue()
                 continue
             }
             // 生命周期消息必须先于日志限流处理：0x4301 可能作为「车机刚打开 CarPlay
@@ -425,6 +575,183 @@ class Iap2SenderSession(
             )
         }
         log("SESSION 保活结束（链路断开）")
+    }
+
+    /** 设备状态问候是否已发过（幂等；[sendDeviceStateGreetings] 的 force 可再发一轮）。 */
+    private var greetingsSent = false
+
+    /**
+     * 设备状态问候：0x4E0D 无线会话标识 / 0x4E0A 语言 / 0x4E09 设备名 /
+     * 0x4E0B 设备时间 / 0x4E0C 设备 UUID。
+     *
+     * **必须紧跟 0xAA05**——上游 PR #17（BMW iD8.5 实车）确认车机据这批消息判定
+     * 发送端已就绪；晚发会被当成还没起来。默认只发一次，[force] = true 时再补一轮
+     * （等待 0x4301 期间的催问、0x5703 迟迟不来时的救援都用它）。
+     */
+    private fun sendDeviceStateGreetings(force: Boolean = false) {
+        if (greetingsSent && !force) return
+        greetingsSent = true
+        val sent = ArrayList<Int>(5)
+        // 0x4E0D（无线可用）与 0x4E0C（设备 UUID）：车机可收清单里没声明也照发，
+        // 只记一条日志（2026-10-27 起取消裁剪，见 [recordUndeclaredReceive]）。
+        recordUndeclaredReceive(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
+        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+        sent += Iap2MessageIds.WIRELESS_CARPLAY_UPDATE
+        send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
+        sent += Iap2MessageIds.DEVICE_LANGUAGE_UPDATE
+        send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
+        sent += Iap2MessageIds.DEVICE_INFORMATION_UPDATE
+        val epochSeconds = System.currentTimeMillis() / 1000L
+        val timezoneMinutes =
+            java.util.TimeZone
+                .getDefault()
+                .getOffset(System.currentTimeMillis()) / 60_000
+        send(
+            Iap2MessageIds.DEVICE_TIME_UPDATE,
+            Iap2Csm.param(0, u64Bytes(epochSeconds)) +
+                Iap2Csm.u16(1, timezoneMinutes and 0xFFFF) +
+                Iap2Csm.u8(2, 0),
+        )
+        sent += Iap2MessageIds.DEVICE_TIME_UPDATE
+        recordUndeclaredReceive(Iap2MessageIds.DEVICE_UUID_UPDATE)
+        send(
+            Iap2MessageIds.DEVICE_UUID_UPDATE,
+            Iap2Csm.string(0, deviceUuid()),
+        )
+        sent += Iap2MessageIds.DEVICE_UUID_UPDATE
+        val tag = if (force) "（补发）" else ""
+        log(
+            "iap2 tx=" + sent.joinToString("/") { "0x%04x".format(it) } +
+                " 设备状态问候$tag（name=$deviceName mac=$bluetoothMac）",
+        )
+    }
+
+    /**
+     * 等待 0x4301 期间的「催问」：重发 0x4e0e + 0x4300。
+     *
+     * 这是**假设验证**用的一步，不是已证实的协议要求：凯迪拉克那台车机声明了
+     * 0x4301/0x6800/0x4c00/0x5000 却一条都不主动发起，最可能的解释是它在等某条
+     * 前置消息。0x4E0E 是「我这条会话挂在蓝牙上」的显式告知，真 iPhone 在
+     * 0x4300 前后都会发；我们此前只在 8s 窗口过期后才补一条。
+     *
+     * 限次（[NUDGE_MAX_TIMES]）而非无限重发：车机若始终不理，继续喂也只会把日志刷满，
+     * 5 分钟窗口到点后由主控拆链重连。
+     *
+     * **车机零回帧时直接跳过催问**（见 [lastNudgePeerFrames]）：催问里的问候是 ACK
+     * 待确认的，喂给一个已经不回 ACK 的会话等于自己触发重传看门狗拆链。
+     */
+    private fun nudgeIfDue() {
+        val now = System.currentTimeMillis()
+        if (now - lastNudgeAt < NUDGE_INTERVAL_MILLIS) return
+        if (nudgeCount >= NUDGE_MAX_TIMES) return
+        lastNudgeAt = now
+        // 车机自 0x4300 起一帧都没回（连纯 ACK 都没有）→ 停止催问。
+        // 这不是「少发几条」的问题：催问里的问候走 send()（ACK 待确认），车机不回 ACK，
+        // 重传看门狗 4 次 × ~4s ≈ 23 秒后 `packet N not acknowledged` 拆链——**催问
+        // 本身就是拆链元凶**，把「最长 5 分钟保活」切成 42 秒一轮的重连死循环（别克
+        // E2LB 2026-10-26 实测 6 轮，12 次 0x4300 全部零回应）。
+        // 静默等待反而能接住晚到的 0x4301；一旦对端恢复回帧，下一轮自动恢复催问。
+        val peerFrames = channel.peerFrameCount
+        val peerSilent = lastNudgePeerFrames >= 0 && peerFrames == lastNudgePeerFrames
+        lastNudgePeerFrames = peerFrames
+        if (peerSilent) {
+            silentNudgeSkips++
+            if (silentNudgeSkips == 1 || silentNudgeSkips % 4 == 0) {
+                log(
+                    "iap2 车机零回帧（累计 $peerFrames 帧），跳过第 $silentNudgeSkips 次催问——" +
+                        "不再喂它没反应的帧，链路保持打开等它自己发 0x4301（继续催问会被重传看门狗拆链）",
+                )
+            }
+            return
+        }
+        nudgeCount++
+        // 先补一轮设备状态问候（上游 PR #17 的「0x5703 分段救援」用的是同一招：
+        // 车机不推进时重发问候，而不是干等），再告诉它传输方式，最后重新询问可用性。
+        sendDeviceStateGreetings(force = true)
+        // 0x4E0E：告诉车机「这条 iAP2 会话的传输是蓝牙」，再问一次能不能开始 CarPlay。
+        // 车机可收清单里没声明也照发（只记录）——2026-10-27 起取消裁剪：别克 E2LB 与
+        // 上游奥迪 3315 的证据都表明「没声明 ≠ 不能收」，裁掉只换来日志更干净。
+        // **0x4300 本来就不裁**：它是驱动 0x4301 的请求本身，宁可多发一次也不能不发。
+        recordUndeclaredReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
+        sendFireAndForget(
+            Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+            Iap2Csm.string(0, bluetoothMac),
+        )
+        sendAvailability()
+        // 第 1 次必记（确认机制真的跑了），之后每 4 次记一条，避免刷屏。
+        if (nudgeCount == 1 || nudgeCount % 4 == 0) {
+            log("iap2 催问第 $nudgeCount 次：重发问候 + 0x4e0e + 0x4300——车机仍未下发 0x4301，链路正常保活中")
+        }
+    }
+
+    /**
+     * 发 `0x4300`（CarPlay 可用性），按本轮选定的报文体形态。
+     *
+     * 三种形态来自参考实现（CarWith-CarPlay）的 `useModernAvailabilityBody` 分档：
+     *  - [AvailabilityBodyMemory.Variant.MODERN_NESTED]：`param1 = {param0={1}, param1=transportId}`
+     *    —— 24 款档，也是我们一直用的、凯迪拉克/DiPlay 都认的形态；
+     *  - [AvailabilityBodyMemory.Variant.LEGACY_FLAT]：`param0={1}` + DeviceIdentifier 字符串
+     *    （`00008110` + MAC 去冒号大写 + `0000`），参考实现**原样与全小写各发一份**
+     *    （老车机对大小写敏感），我们照抄；
+     *  - [AvailabilityBodyMemory.Variant.NONE]：23 款档根本不发——这批车机疑似不吃任何形态。
+     *
+     * 都是发后不管（[sendFireAndForget]）：0x4300 曾被实测「ACK 但有车机从此沉默」，
+     * 进重传队列只会让看门狗提前把链路杀掉。
+     */
+    private fun sendAvailability() {
+        when (availabilityVariant ?: AvailabilityBodyMemory.Variant.MODERN_NESTED) {
+            AvailabilityBodyMemory.Variant.MODERN_NESTED ->
+                sendFireAndForget(
+                    Iap2MessageIds.CARPLAY_AVAILABILITY,
+                    Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
+                )
+
+            AvailabilityBodyMemory.Variant.LEGACY_FLAT -> {
+                val identifier = legacyDeviceIdentifier()
+                val flat = { value: String -> Iap2Csm.u8(0, 1) + Iap2Csm.string(1, value) }
+                sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, flat(identifier))
+                sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, flat(identifier.lowercase()))
+            }
+
+            AvailabilityBodyMemory.Variant.NONE ->
+                log("iap2 0x4300 本轮不发（该车机对两种报文体都无反应——只等它自己发 0x4301）")
+        }
+    }
+
+    /**
+     * 判定「0x4300 是否把车机的控制会话打住了」，并据此推进报文体阶梯。
+     *
+     * 判据：从发出 0x4300 到整个等待窗口结束，[Iap2LinkChannel.peerFrameCount] 一次都没涨
+     * ——连纯 ACK 都没有。2026-10-26 别克 E2LB 日志就是这种形态：ACK 停在 0x4e0c，
+     * 之后 23 秒只有 `ff 55 02 00 ee 10` 链路心跳，最后我方看门狗
+     * `packet N not acknowledged` 拆链 → 每 40 秒一轮死循环。
+     *
+     * 注意：这不是「车机不发 0x4301」的证据（这个家族从来不发），只是「它不认这一帧」
+     * 的证据。所以判到静默就换下一档，而不是断言此路不通。
+     */
+    private fun noteAvailabilitySilence(
+        framesBefore: Int,
+        windowNanos: Long,
+    ) {
+        val variant = availabilityVariant ?: return
+        if (variant == AvailabilityBodyMemory.Variant.NONE) return
+        val framesAfter = channel.peerFrameCount
+        if (framesAfter != framesBefore) return
+        val next = AvailabilityBodyMemory.recordSilent(context, receiverIdentity, variant)
+        log(
+            "iap2 ⚠ 0x4300（${variant.label}）发出后 ${windowNanos / 1_000_000_000}s 内车机零反馈：" +
+                "连链路层 ACK 都没回（同一份字节在凯迪拉克 CADILLAC_7731 上是正常 ACK 的），" +
+                "疑似该固件不认这个报文体；已记为静默，下一轮改用「${next.label}」",
+        )
+    }
+
+    /**
+     * 老版可用性报文里的 DeviceIdentifier（参考实现 `Ct5Variants` 的拼法）：
+     * `00008110` + 本机蓝牙 MAC（去冒号、大写）+ `0000`；MAC 形态不对时用参考实现的兜底值。
+     */
+    private fun legacyDeviceIdentifier(): String {
+        val mac = bluetoothMac.filter { it.isLetterOrDigit() }.uppercase()
+        return if (mac.length == 12) "00008110${mac}0000" else "00008110000105201EDA801E"
     }
 
     /**
@@ -536,9 +863,13 @@ class Iap2SenderSession(
             log("iap2 rx=0x4301（晚到）——无线组里没解析出 SSID，本条忽略")
             return
         }
+        // 凭据到手，不用再催了（催问频率与日志噪音都到此为止）。
+        if (awaitingStartSession) {
+            awaitingStartSession = false
+            log("iap2 催问共 ${nudgeCount} 次后收到可用 0x4301——停止催问")
+        }
         // 车机可能周期性重发同一份 0x4301：详情只在端点变化时打，避免刷日志。
-        if (endpoint.hashCode() != lastLateStartSessionSignature) {
-            lastLateStartSessionSignature = endpoint.hashCode()
+        if (endpoint.hashCode() != lastLateStartSessionSignature) {            lastLateStartSessionSignature = endpoint.hashCode()
             log(
                 "iap2 rx=0x4301（晚到，Phase 1 之后）airPlayPort=${endpoint.airPlayPort} " +
                     "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKey?.take(16)}… " +
@@ -617,8 +948,10 @@ class Iap2SenderSession(
                 val frame = recvFrame(remaining)
                 if (frame == null) {
                     if (!channel.isAlive) {
-                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
-                        MfiLengthMemory.recordRejected(context, receiverKey, size)
+                        // 挑战期间被对端断开 = **强证据**，走硬拒绝：即使该长度曾被记成
+                        // 「成功」也要推翻（迟到应答的归属歧义，见 MfiLengthMemory.recordHardRejected）。
+                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位（硬拒绝，可推翻旧的成功记忆）")
+                        MfiLengthMemory.recordHardRejected(context, receiverKey, size)
                         return
                     }
                     continue
@@ -756,7 +1089,17 @@ class Iap2SenderSession(
         while (true) {
             val remaining = (hidWindowNanos - System.nanoTime()) / 1_000_000L
             if (remaining <= 0) {
-                log("iap2 未收到 0x6800（该接收端不发 StartHID，继续）")
+                // 措辞要看声明：车机在 0x1D01 的发送清单里**有** 0x6800 时（别克 E2LB、
+                // 凯迪拉克 Cinemo 都有）它只是这一刻还没发——写成「该接收端不发 StartHID」
+                // 会让人以为清单没声明，和上面那行「StartHID=会发」自相矛盾。
+                log(
+                    "iap2 ${HID_WAIT_NANOS / 1_000_000_000}s 内未收到 0x6800 StartHID" +
+                        (if (accessoryDeclaresSend(Iap2MessageIds.START_HID) == true) {
+                            "（车机声明会发，可能等 0x4300 之后才开 HID）——继续"
+                        } else {
+                            "（车机未声明清单，按不发处理）——继续"
+                        }),
+                )
                 return
             }
             val frame = recvFrame(remaining)
@@ -969,26 +1312,33 @@ class Iap2SenderSession(
             )
         }
         if (receives != null) {
-            // 车机能否收 0x5702 决定要不要走旧协议——不接受就必须走 0x4300/0x4301
-            // （BMW iD9 的可收清单里没有 0x5702，旧流程因此每轮死等 0x5703 超时）。
+            // 可收清单只作**参考与日志**：它能证明「车机有」，不能证明「没有」
+            // （BMW iD9 的清单里没有 0x5702 → 画像判 NEW；奥迪 3315 的清单里也没有，
+            //  但旧协议完好 → 画像判 UNKNOWN，照样发 0x5702）。
             accessoryReceiveIds = receives.toSet()
             receiveListDeclared = true
             log("iap2 0x1d01 车机可收清单(${receives.size})=" + receives.joinToString(" ") { "0x%04x".format(it) })
             // 车机画像（信号收口点）：身份 + 双清单 → era/wifiGen 一行判定，
             // 依据随行——判错时从这里回溯是哪条信号误导（铁律：按能力不按品牌）
-            log(
-                ReceiverProfile.describe(
-                    ReceiverProfile.classify(
-                        ReceiverProfile.Signals(
-                            name = name,
-                            model = model,
-                            manufacturer = manufacturer,
-                            sendIds = sends?.toSet(),
-                            receiveIds = receives.toSet(),
-                        ),
+            val profile =
+                ReceiverProfile.classify(
+                    ReceiverProfile.Signals(
+                        name = name,
+                        model = model,
+                        manufacturer = manufacturer,
+                        sendIds = sends?.toSet(),
+                        receiveIds = receives.toSet(),
                     ),
-                ),
-            )
+                )
+            log(ReceiverProfile.describe(profile))
+            // 画像结论是本轮 WiFi 分派的唯一依据（见 wifiGen 字段注释）
+            wifiGen = profile.wifiGen
+            val dispatchHint =
+                if (profile.wifiGen == ReceiverProfile.WifiGen.NEW) {
+                    "不发 0x5702（等 0x4301 给 AP 信息）"
+                } else {
+                    "发 0x5702（清单不全/未声明也发，超时降级不拆链）"
+                }
             log(
                 "iap2 0x1d01 协议代际：请求 WiFi 配置(0x5702)=" +
                     (
@@ -1001,10 +1351,46 @@ class Iap2SenderSession(
                         accessoryDeclaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)?.let {
                             if (it) "会发" else "不发"
                         } ?: "未知"
-                    ),
+                    ) +
+                    " → 本轮$dispatchHint",
             )
         }
+        logTransportComponents(params)
         log("iap2 0x1d01 原始体=" + frame.body.joinToString("") { "%02x".format(it) })
+    }
+
+    /**
+     * 0x1D01 参数 0x11 / 0x12 / 0x18：车机自报的「传输组件」。
+     *
+     * 实测 Cinemo 栈一族（别克 E2LB、凯迪拉克 CT5，两组字节逐字节相同）：
+     *  - 0x11 子参 0=2 → `CinemoBTComponent`（子参 3 还带一个 `4C:92` 标识）
+     *  - 0x18 子参 0=3 → `CinemoWIFIComponent`
+     *  - 0x12 子参 0=1 → `CinemoHIDRemote`
+     *
+     * 意义：它把「蓝牙 / Wi-Fi / HID 遥控」三个传输都声明出来了，说明这套车机
+     * **硬件与栈层面确实具备无线 CarPlay**，不推进只是应用层没被唤醒（对照它一条
+     * 主动消息都不发）。也留了个待验证问题：0x4300 内层那个 `1` 如果是传输组件号，
+     * WiFi 应为 `3` —— 现在按参考实现发 1，先记下来当下一轮实验项。
+     */
+    private fun logTransportComponents(params: Map<Int, Iap2Csm.Param>) {
+        val groups = intArrayOf(0x11, 0x12, 0x18)
+        val parts = ArrayList<String>(groups.size)
+        for (groupId in groups) {
+            val value = params[groupId]?.value ?: continue
+            val sub = Iap2Csm.parseParams(value).associateBy { it.id }
+            val kindBytes = sub[0]?.value
+            val kind =
+                if (kindBytes == null) {
+                    -1
+                } else if (kindBytes.size >= 2) {
+                    ((kindBytes[0].toInt() and 0xFF) shl 8) or (kindBytes[1].toInt() and 0xFF)
+                } else {
+                    kindBytes[0].toInt() and 0xFF
+                }
+            val name = sub[1]?.value?.asStringOrEmpty() ?: "?"
+            parts += "${name}(id=$kind)"
+        }
+        if (parts.isNotEmpty()) log("iap2 0x1d01 传输组件：" + parts.joinToString(" / "))
     }
 
     private fun remainingMillis(deadlineNanos: Long): Long {
