@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * 「本地劫持原生 CarLife」总控 —— **可选**的增强画面来源。
  *
- * 2026-10-24 产品方向变更：默认画面来源回归 **CarDeck 自绘桌面**（CarDeck 自己扮演
+ * 2026-10-24 产品方向变更：默认画面来源回归 **CarPToCarL 自绘桌面**（CarPToCarL 自己扮演
  * 「CarLife+ 发送端」的内容角色，协议仍是 CarPlay/AirPlay，见 SessionController
  * 的自绘分支）。本模块降级为 opt-in：只有用户在设置里打开「本地 CarLife 劫持」
  * 才会守候 7240 并接管原生 CarLife+ 码流。
@@ -61,7 +61,7 @@ object CarLifeHijack {
      * 一次性迁移标记 v1（历史）：曾把劫持对老安装强制开启一次。
      *
      * 2026-10-24 方向变更后被 v2 取代：v2 把被 v1 强开的劫持一次性关回去，
-     * 默认画面来源回归 CarDeck 自绘桌面。
+     * 默认画面来源回归 CarPToCarL 自绘桌面。
      */
     private const val KEY_MIGRATED_ON = "carlife_hijack_default_on_v1"
 

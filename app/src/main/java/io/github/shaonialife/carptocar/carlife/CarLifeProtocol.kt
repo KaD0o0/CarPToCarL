@@ -297,7 +297,7 @@ internal object CarLifeProtocol {
         var list = ByteArray(0)
         for (item in items) list += pbBytes(2, item)
         val cnt = items.size
-        return pbVarint(1, cnt) + list + pbVarint(3, 0) + pbString(4, "CarDeck") + pbString(5, "00:11:22:33:44:55")
+        return pbVarint(1, cnt) + list + pbVarint(3, 0) + pbString(4, "CarPToCarL") + pbString(5, "00:11:22:33:44:55")
     }
 
     /**
