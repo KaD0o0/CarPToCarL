@@ -1,6 +1,7 @@
 package io.github.shaonialife.carptocar.iap2
 
 import io.github.shaonialife.carptocar.transport.Iap2LinkChannel
+import io.github.shaonialife.carptocar.util.SessionTrace
 import java.io.IOException
 import java.security.SecureRandom
 
@@ -1013,6 +1014,7 @@ class Iap2SenderSession(
             offset = end
         }
         log("iap2 tx=0x${messageId.toString(16).padStart(4, '0')}")
+        SessionTrace.csm(SessionTrace.Dir.TX, "bt", messageId, joined)
     }
 
     /** [send] 的发后不管变体：链路不因对端不 ACK 此消息而重传/死亡（见 0x4E0E）。 */
@@ -1031,6 +1033,7 @@ class Iap2SenderSession(
             offset = end
         }
         log("iap2 tx=0x${messageId.toString(16).padStart(4, '0')}（发后不管）")
+        SessionTrace.csm(SessionTrace.Dir.TX, "bt", messageId, body, "fire-and-forget")
     }
 
     private fun expect(
@@ -1149,6 +1152,9 @@ class Iap2SenderSession(
         val bytes = channel.recvControl(timeoutMillis) ?: return null
         val frames = parser.offer(bytes)
         if (frames.isEmpty()) return null
+        // 完整会话录制：原始报文（含 0x1D01 能力清单这类大包）进 session_trace.log，
+        // 与 main_debug.log 的摘要行按时间戳对齐，用于事后离线分析拆链/超时。
+        frames.forEach { SessionTrace.csm(SessionTrace.Dir.RX, "bt", it.messageId, it.body) }
         frames.forEachIndexed { index, frame -> if (index > 0) receivedFrames += frame }
         return frames.first()
     }

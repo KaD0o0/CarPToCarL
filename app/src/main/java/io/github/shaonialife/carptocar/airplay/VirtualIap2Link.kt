@@ -9,6 +9,7 @@ import io.github.shaonialife.carptocar.iap2.Iap2MessageIds
 import io.github.shaonialife.carptocar.iap2.Iap2NowPlaying
 import io.github.shaonialife.carptocar.iap2.MfiLengthMemory
 import io.github.shaonialife.carptocar.input.ConsumerKeys
+import io.github.shaonialife.carptocar.util.SessionTrace
 import java.security.SecureRandom
 import java.util.TimeZone
 import java.util.UUID
@@ -473,16 +474,33 @@ class VirtualIap2Link(
             "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B ok=$ok",
         )
+        SessionTrace.csm(SessionTrace.Dir.TX, "tunnel", messageId, body, if (ok) "" else "send-failed")
     }
 
     /** 直接投递完整 CSM 帧（Frida 抓的逐字节常量，勿重新编码）。 */
     private fun sendRawCsmLocked(frame: ByteArray) {
         val ok = engine.sendControl(frame, System.nanoTime() / 1_000_000L)
-        val messageId = ((frame[2].toInt() and 0xFF) shl 8) or (frame[3].toInt() and 0xFF)
+        // 帧头：0..1 起始字、2..3 总长度、4..5 messageId、6.. body。
+        // 旧实现从 2..3 取 ID（那是长度），日志里的「隧道 tx 0x0100」全是假 ID。
+        val messageId =
+            if (frame.size >= Iap2Csm.HEADER_BYTES) {
+                ((frame[4].toInt() and 0xFF) shl 8) or (frame[5].toInt() and 0xFF)
+            } else {
+                -1
+            }
         log(
             "IAPLINK: 隧道 tx 0x${messageId.toString(16)} " +
                 "(${Iap2MessageIds.nameOf(messageId)}) ${frame.size}B raw ok=$ok",
         )
+        if (messageId >= 0) {
+            SessionTrace.csm(
+                SessionTrace.Dir.TX,
+                "tunnel",
+                messageId,
+                frame.copyOfRange(Iap2Csm.HEADER_BYTES, frame.size),
+                if (ok) "raw" else "raw,send-failed",
+            )
+        }
     }
 
     /**
@@ -828,10 +846,14 @@ class VirtualIap2Link(
                         "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B hex=${hex.take(160)}",
                 )
             }
+            // 摘要行按条数抽样（上），录制行全量（下）：事后分析拆链时，被抽掉的那几条
+            // 往往正是关键（例如某条订阅的应答没发）。
+            SessionTrace.csm(SessionTrace.Dir.RX, "tunnel", frame.messageId, frame.body)
             maybeRespondControlCsmLocked(frame)
         }
         if (frames.isEmpty() && frameCount <= 10) {
             log("IAPLINK: rx ${bytes.size}B（非 CSM）hex=" + bytes.joinToString(" ") { "%02x".format(it) }.take(160))
+            SessionTrace.mark("隧道 rx ${bytes.size}B 非 CSM: " + bytes.joinToString(" ") { "%02x".format(it) }.take(400))
         }
     }
 
