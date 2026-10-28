@@ -2,6 +2,7 @@ package io.github.shaonialife.carptocar.airplay
 
 import android.content.Context
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
+import io.github.shaonialife.carptocar.iap2.Iap2CapabilityReport
 import io.github.shaonialife.carptocar.iap2.Iap2Csm
 import io.github.shaonialife.carptocar.iap2.Iap2LinkEngine
 import io.github.shaonialife.carptocar.iap2.Iap2MessageIds
@@ -512,23 +513,27 @@ class VirtualIap2Link(
                         "name=${params[0]?.value?.decodeToString()?.trimEnd('\u0000')} " +
                         "model=${params[1]?.value?.decodeToString()?.trimEnd('\u0000')}",
                 )
-                // 参 6/7 = 车机声明「它会发 / 它可收」的消息清单。媒体键排查就靠这两行：
-                // 若 0x6800/0x6802 不在发送清单里，说明这台车机根本不用 iAP2 HID 送按键，
-                // 不必再在这条通路上耗（改查蓝牙/AVRCP 侧）。
+                // 参 6/7 = 车机声明「它会发 / 它可收」的消息清单。三层输出见 Iap2CapabilityReport
+                // （原始清单 / 按子系统分组 / 目录里没有的陌生 ID）：
+                //   · 媒体键排查看**发送清单**里有没有 0x6800/0x6802；
+                //   · 投仪表/HUD 看**可收清单**里有没有导航引导 0x52xx（MIB3 4398 起）。
                 params[6]?.value?.let { raw ->
                     val sends = u16List(raw)
-                    log(
-                        "IAPLINK: 车机发送清单(${sends.size})=" +
-                            sends.joinToString(" ") { "0x%04x".format(it) } +
-                            " 含HID0x6800=${sends.contains(Iap2MessageIds.START_HID)}" +
-                            " 含0x6802=${sends.contains(Iap2MessageIds.ACCESSORY_HID_REPORT)}",
-                    )
+                    Iap2CapabilityReport.report(log, "IAPLINK: ", "发送清单", sends, isReceiveList = false)
+                    if (!sends.contains(Iap2MessageIds.START_HID)) {
+                        log(
+                            "IAPLINK: 发送清单无 0x6800 StartHID → 这台车机不用 iAP2 HID 送按键，" +
+                                "不必在这条通路耗（改查蓝牙/AVRCP 侧）",
+                        )
+                    }
                 }
                 params[7]?.value?.let { raw ->
-                    val receives = u16List(raw)
-                    log(
-                        "IAPLINK: 车机可收清单(${receives.size})=" +
-                            receives.joinToString(" ") { "0x%04x".format(it) },
+                    Iap2CapabilityReport.report(
+                        log,
+                        "IAPLINK: ",
+                        "可收清单",
+                        u16List(raw),
+                        isReceiveList = true,
                     )
                 }
                 if (mib3) {
@@ -678,12 +683,30 @@ class VirtualIap2Link(
                 // 带全量 hex：宝马 iD9 的 0xad00/0xad02/0xad03 家族既不在 Apple 公开表里，
                 // 也没有参考实现的命名——只能靠报文体结构反推它是不是输入（触摸/HID）通路。
                 unknownCsmIds++
-                if (unknownCsmIds <= 20) {
-                    log(
-                        "IAPLINK: 未处理的 CSM 0x${frame.messageId.toString(16)} " +
-                            "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B hex=" +
-                            frame.body.joinToString(" ") { "%02x".format(it) },
-                    )
+                val navFrame =
+                    Iap2CapabilityReport.groupOf(frame.messageId) == Iap2CapabilityReport.Group.NAVIGATION
+                when {
+                    // 导航引导单独一支：不设条数上限、不截断。车机若主动下发 0x52xx
+                    // （MIB3 4398/CL3B 起可能为投仪表而订阅），报文体就是最直接的样本——
+                    // 参数编号、字节序、是否带 maneuver 字段，全在这行里。
+                    navFrame -> {
+                        val navParams = Iap2Csm.parseParams(frame.body)
+                        log(
+                            "IAPLINK: ★ 导航引导 CSM 0x${frame.messageId.toString(16)} " +
+                                "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B " +
+                                "params=" + navParams.joinToString(",") {
+                                    "#${it.id}=" + it.value.joinToString("") { b -> "%02x".format(b) }
+                                } +
+                                " hex=" + frame.body.joinToString(" ") { "%02x".format(it) },
+                        )
+                    }
+                    unknownCsmIds <= 20 -> {
+                        log(
+                            "IAPLINK: 未处理的 CSM 0x${frame.messageId.toString(16)} " +
+                                "(${Iap2MessageIds.nameOf(frame.messageId)}) ${frame.body.size}B hex=" +
+                                frame.body.joinToString(" ") { "%02x".format(it) },
+                        )
+                    }
                 }
             }
         }

@@ -1303,7 +1303,7 @@ class Iap2SenderSession(
         if (sends != null) {
             // 后续可选消息（0x6800/0x4301）按此清单判断是否会来，避免固定窗口空等
             accessorySendIds = sends.toSet()
-            log("iap2 0x1d01 车机发送清单(${sends.size})=" + sends.joinToString(" ") { "0x%04x".format(it) })
+            Iap2CapabilityReport.report(log, "iap2 0x1d01 ", "发送清单", sends, isReceiveList = false)
             log(
                 "iap2 0x1d01 可选消息声明：StartHID(0x6800)=" +
                     (accessoryDeclaresSend(Iap2MessageIds.START_HID)?.let { if (it) "会发" else "不发" } ?: "未知") +
@@ -1317,7 +1317,9 @@ class Iap2SenderSession(
             //  但旧协议完好 → 画像判 UNKNOWN，照样发 0x5702）。
             accessoryReceiveIds = receives.toSet()
             receiveListDeclared = true
-            log("iap2 0x1d01 车机可收清单(${receives.size})=" + receives.joinToString(" ") { "0x%04x".format(it) })
+            // 三层输出（原始/分类/陌生 ID）+ 导航专判：MIB3 4398（CL3B）起若车机接受
+            // CarPlay 导航数据，会在这里出现 0x52xx —— 那是投仪表/HUD 的唯一入口
+            Iap2CapabilityReport.report(log, "iap2 0x1d01 ", "可收清单", receives, isReceiveList = true)
             // 车机画像（信号收口点）：身份 + 双清单 → era/wifiGen 一行判定，
             // 依据随行——判错时从这里回溯是哪条信号误导（铁律：按能力不按品牌）
             val profile =
