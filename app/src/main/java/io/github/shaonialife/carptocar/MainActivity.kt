@@ -942,9 +942,14 @@ class MainActivity : AppCompatActivity() {
      * 直通模式下由 CarLife 引擎决定，而且**会变**：会话建立时引擎往往还停在默认
      * 1280×720，收到车机分辨率（98311）之后才重建编码器。所以这里每次现取，
      * 不能只记建链那一刻的快照——否则界面会一直显示临时值。
+     *
+     * 取值顺序是硬性的：**先 SPS 真值**。98311 申请值与 65544 回包值都只是「谈定的
+     * 档位」，引擎会按白名单降档（申请 1412×654 实编 1280×720，2026-10-29 日志实证）。
+     * 拿协商值当码流尺寸，界面就会写着「码流同尺寸」而车机上根本不是那个尺寸。
      */
     private fun effectiveStreamSize(): Pair<Int, Int>? {
         if (CarLifeHijack.isAttached || CarLifeHijack.isActive) {
+            CarLifeHijack.actualStreamSize?.let { return it }
             val (w, h) = CarLifeHijack.videoSize
             if (w > 0 && h > 0) return w to h
         }
@@ -952,6 +957,18 @@ class MainActivity : AppCompatActivity() {
         val h = SessionController.activeStreamHeight
         return if (w > 0 && h > 0) w to h else null
     }
+
+    /**
+     * 码流尺寸是否已经由 SPS 确认（false = 手上只有协商档位，还在等第一帧关键帧）。
+     *
+     * 非直通模式（自己出画面）没有「协商 vs 实编」这回事，恒为 true。
+     */
+    private fun streamSizeConfirmed(): Boolean =
+        if (CarLifeHijack.isAttached || CarLifeHijack.isActive) {
+            CarLifeHijack.actualStreamSize != null
+        } else {
+            true
+        }
 
     /**
      * 英雄卡统计行（仅连接时显示）：运行时分辨率 + 实测帧率。
@@ -998,12 +1015,17 @@ class MainActivity : AppCompatActivity() {
                 val carW = SessionController.activeCarWidth
                 val carH = SessionController.activeCarHeight
                 val stream = effectiveStreamSize()
-                if (!SessionController.activeCarResolutionFromCar) {
-                    "⚑ 车机未通告分辨率 · 按手机横屏 $carW×$carH 兜底"
-                } else if (stream != null && (stream.first != carW || stream.second != carH)) {
-                    "车机 $carW×$carH · 码流 ${stream.first}×${stream.second}（由 CarLife 引擎定尺寸）"
-                } else {
-                    "车机 $carW×$carH · 码流同尺寸"
+                val confirmed = streamSizeConfirmed()
+                when {
+                    !SessionController.activeCarResolutionFromCar ->
+                        "⚑ 车机未通告分辨率 · 按手机横屏 $carW×$carH 兜底"
+                    // 还没解析到 SPS：手上的 stream 只是协商档位，不能当成「同尺寸」
+                    !confirmed && (stream == null || (stream.first == carW && stream.second == carH)) ->
+                        "车机 $carW×$carH · 码流待确认（等首个关键帧）"
+                    stream != null && (stream.first != carW || stream.second != carH) ->
+                        "车机 $carW×$carH · 码流 ${stream.first}×${stream.second}" +
+                            "（引擎按档位编码，非车机画布）"
+                    else -> "车机 $carW×$carH · 码流同尺寸"
                 }
             } else {
                 val last = DisplayPrefs.lastSession(this)
@@ -1017,7 +1039,7 @@ class MainActivity : AppCompatActivity() {
                         "上次：车机未通告 · 按手机横屏 ${last.carWidth}×${last.carHeight} 兜底"
                     streamDiffers ->
                         "上次：车机 ${last.carWidth}×${last.carHeight} · " +
-                            "码流 ${last.streamWidth}×${last.streamHeight}"
+                            "码流 ${last.streamWidth}×${last.streamHeight}（引擎按档位编码）"
                     else -> "上次：车机 ${last.carWidth}×${last.carHeight}"
                 }
             }
@@ -1200,7 +1222,14 @@ class MainActivity : AppCompatActivity() {
                 when {
                     runningNow ->
                         "保存后下次连接起效；当前连接按 ${SessionController.activeScalePercent}% 运行" +
-                            (mapped?.let { "（$it）" } ?: "")
+                            (mapped?.let { "（$it）" } ?: "") +
+                            // 直通模式下码流尺寸是 CarLife 引擎说了算，缩放只影响本地虚拟屏：
+                            // 不点明的话，这行的像素换算会被当成「实际在推的分辨率」。
+                            if (CarLifeHijack.isAttached || CarLifeHijack.isActive) {
+                                " · 直通码流由引擎定"
+                            } else {
+                                ""
+                            }
                     mapped != null -> "保存后下次连接起效 · $mapped"
                     else -> "保存后下次连接起效"
                 }

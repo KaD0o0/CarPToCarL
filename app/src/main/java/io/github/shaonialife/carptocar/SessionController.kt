@@ -748,6 +748,8 @@ object SessionController {
         // 只断车机视频通道，不拆 CarLife 劫持本身：本方法在每轮配对起步也会执行，
         // 而 CarLife 连接与 GOP 缓存要跨会话保留（用户可以在会话中途才进「无线连接」）。
         CarLifeHijack.detach()
+        // 回调属于上一轮会话（捕获了旧的 appendLog 语境），退役时一并摘掉。
+        CarLifeHijack.onActualStreamSize = null
         videoSender?.stop()
         videoSender = null
         // 暗幕/常亮随会话收掉（本方法在每轮配对起步也会执行，新一轮推流起来后会重新置位）
@@ -2720,6 +2722,28 @@ object SessionController {
                                         appendLog("MODE: 视频通道未创建，本轮无画面")
                                     } else if (target.startPassthrough()) {
                                         appendLog("MODE: CarLife 直通（车机画面 = 本机 CarLife+）")
+                                        // 引擎**实编**尺寸只有 SPS 说得准：98311 申请值/65544
+                                        // 回包值都只是「谈定的档位」，引擎会按白名单降档
+                                        // （申请 1412×654 实编 1280×720，2026-10-29 实测）。
+                                        // 界面与落盘一律跟真值走，否则「码流同尺寸」是假的。
+                                        CarLifeHijack.onActualStreamSize = { w, h ->
+                                            activeStreamWidth = w
+                                            activeStreamHeight = h
+                                            appContext?.let { ctx ->
+                                                DisplayPrefs.updateLastStream(ctx, w, h)
+                                            }
+                                            val negotiated = activeCarWidth > 0 &&
+                                                (w != activeCarWidth || h != activeCarHeight)
+                                            appendLog(
+                                                "DISPLAY: 实际码流 ${w}×$h" +
+                                                    if (negotiated) {
+                                                        "（引擎降档，车机画布 " +
+                                                            "${activeCarWidth}×${activeCarHeight}）"
+                                                    } else {
+                                                        ""
+                                                    },
+                                            )
+                                        }
                                         CarLifeHijack.attach(target) { line -> appendLog(line) }
                                         ScreenDimmer.setSessionActive(true)
                                     } else {
