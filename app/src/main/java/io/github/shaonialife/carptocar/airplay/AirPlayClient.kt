@@ -755,11 +755,19 @@ class AirPlayClient(
         val infoMap = loadInfoWithDiagnostics()
         infoRoot = infoMap
         val display = (infoMap?.get("displays") as? List<*>)?.firstOrNull() as? Map<*, *>
-        if (display == null) {
+        // 车机分辨率：`displays[0].widthPixels/heightPixels`。宽容解析见 CarDisplayGeometry——
+        // 这里一旦静默落空，整条链路（流画布 / 虚拟屏 / CarLife 98311 / 触摸映射）就全部
+        // 按手机分辨率跑，画面比例当场错，所以成功与失败都必须落一条日志。
+        val carDisplay = CarDisplayGeometry.fromInfo(infoMap)
+        val fallbackDisplay = phoneFallbackSize()
+        if (carDisplay == null) {
             log(
-                "AIRPLAY: 未取得 /info displays → 显示屏参数退回手机分辨率兜底" +
-                    "（车机侧可能是小画面/黑边）；HID 设备为空 → 车机不会发 hidSendReport（触摸不可用）",
+                "AIRPLAY: 车机未通告显示屏（/info displays 缺失或宽高非法）→ 兜底 " +
+                    "${fallbackDisplay.first}×${fallbackDisplay.second}（手机横屏尺寸；车机侧可能拉伸/黑边）；" +
+                    "HID 设备为空 → 车机不会发 hidSendReport（触摸不可用）",
             )
+        } else {
+            log("AIRPLAY: 车机显示屏 ${carDisplay.text}（${carDisplay.source}）")
         }
         // /info 全量转储：找奥迪私有的数据流 UUID（type-130 的 clientTypeUUID 候选）、
         // HID 设备描述（触摸）、以及任何我们没实现的能力声明
@@ -830,8 +838,11 @@ class AirPlayClient(
                 timingPort = portOf(root["timingPort"]),
                 keepAlivePort = root["keepAlivePort"]?.let(::portOf)?.takeIf { it != 0 },
                 enabledFeatures = (root["enabledFeatures"] as? List<*>)?.map { it.toString() }.orEmpty(),
-                displayWidth = ((display?.get("widthPixels") as? Long) ?: 1080L).toInt(),
-                displayHeight = ((display?.get("heightPixels") as? Long) ?: 2320L).toInt(),
+                displayWidth = carDisplay?.width ?: fallbackDisplay.first,
+                displayHeight = carDisplay?.height ?: fallbackDisplay.second,
+                // 来源标记：UI 要据此区分「车机通告的」与「手机兜底的」，
+                // 后者意味着车机没执行 /info，画面比例与触摸都可能不准。
+                displayFromCar = carDisplay != null,
                 // /info displays[0] 的显示屏 UUID（真实 iPhone 会把它回填进屏幕流 SETUP；
                 // 键名以小写 "uuid" 为准，大写 "UUID" 兜底）
                 displayUuid =
@@ -840,7 +851,7 @@ class AirPlayClient(
                             ?: display?.get("UUID")
                             ?: display?.get("displayUUID"),
                     ),
-                maxFps = ((display?.get("maxFPS") as? Long) ?: 30L).toInt(),
+                maxFps = CarDisplayGeometry.positiveInt(display?.get("maxFPS")) ?: 30,
                 hidDeviceUuids = parsedHidUuids,
                 hidDescriptors = parsedHidDescriptors,
                 // 奥迪 MMI 0000 声明 true：屏幕流 keepAlive 用 opcode=5 带 bplist 统计体
@@ -849,8 +860,9 @@ class AirPlayClient(
         log(
             "AIRPLAY: ✓ SETUP 完成 eventPort=${info.eventPort} timingPort=${info.timingPort} " +
                 "keepAlive=${info.keepAlivePort ?: "无"} features=${info.enabledFeatures} " +
-                "display=${info.displayWidth}x${info.displayHeight}@${info.maxFps} " +
-                "displayUuid=${info.displayUuid}",
+                "display=${info.displayWidth}x${info.displayHeight}@${info.maxFps}" +
+                (if (info.displayFromCar) "" else "（车机未通告·手机兜底）") +
+                " displayUuid=${info.displayUuid}",
         )
         return info
     }
@@ -1028,6 +1040,13 @@ class AirPlayClient(
         /** 主显示屏参数（/info displays[0]，跟随接收端当前屏幕方向）。 */
         val displayWidth: Int,
         val displayHeight: Int,
+        /**
+         * 宽高是否真的来自车机（/info displays[0]）。
+         *
+         * false = 车机没通告、按手机横屏兜底——此时「车机分辨率」无从谈起，
+         * UI 必须照实标注，不能把兜底值当成车机参数展示。
+         */
+        val displayFromCar: Boolean = false,
         val displayUuid: String?,
         val maxFps: Int,
         /** /info hidDevices[].uuid 列表（0=触摸、1=旋钮；DiPlay 同款编号）。 */
@@ -1501,8 +1520,40 @@ class AirPlayClient(
         val sampleRate: Int = 48_000,
     )
 
-    /** plist 端口是 u16 但以 2 字节有符号整数编码（>32767 读出为负），按位掩出真实值。 */
-    private fun portOf(value: Any?): Int = ((value as? Long) ?: 0L).toInt() and 0xFFFF
+    /**
+     * 端口解析：plist 端口是 u16，但部分固件按 2 字节有符号整数编码（>32767 读出为负），
+     * 所以先取低 16 位再返回。
+     *
+     * **不能**借 [CarDisplayGeometry.positiveInt]：那个函数带 8192 上限（防分辨率字段
+     * 解析错位），而 TCP 数据端口常态在 49152 以上，套上去会全变 0，视频口直接连不上。
+     */
+    private fun portOf(value: Any?): Int {
+        val raw =
+            when (value) {
+                is Number -> value.toInt()
+                is String -> value.trim().toIntOrNull() ?: 0
+                else -> 0
+            }
+        return raw and 0xFFFF
+    }
+
+    /**
+     * 车机没通告显示屏时的画布兜底：手机屏幕的**横屏**尺寸（长边为宽）。
+     *
+     * 旧代码写死 1080×2320——那是手机的**竖屏**分辨率，当成车机画布用必然比例全错
+     * （画面转 90° 或被车机拉伸）。车机屏幕绝大多数是横向，按手机长边当宽至少能给出
+     * 一个同数量级、同画幅比例的画布。注意这只是兜底，`displayFromCar=false` 时
+     * UI 会明确标注，不能当成车机真实分辨率。
+     */
+    private fun phoneFallbackSize(): Pair<Int, Int> {
+        val metrics = context?.resources?.displayMetrics
+        val a = metrics?.widthPixels ?: 0
+        val b = metrics?.heightPixels ?: 0
+        if (a <= 0 || b <= 0) return 1280 to 720
+        val wide = maxOf(a, b) / 2 * 2
+        val short = minOf(a, b) / 2 * 2
+        return wide to short
+    }
 
     private companion object {
         /** 主屏视频流类型（对照接收端 STREAM_TYPE_MAIN_SCREEN；100 是音频、130 是数据/iAP 隧道）。 */

@@ -88,6 +88,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnResidualCleanup: TextView
     private lateinit var heroSubline: TextView
     private lateinit var heroStats: TextView
+    /** 「显示」卡片里的分辨率行（车机通告值 + 本次码流尺寸）。 */
+    private lateinit var displayResolutionNote: TextView
     private lateinit var heroProgress: View
     private lateinit var ctaButton: LinearLayout
     private lateinit var ctaIcon: ImageView
@@ -513,6 +515,7 @@ class MainActivity : AppCompatActivity() {
         }
         heroSubline = findViewById(R.id.heroSubline)
         heroStats = findViewById(R.id.heroStats)
+        displayResolutionNote = findViewById(R.id.displayResolutionNote)
         heroProgress = findViewById(R.id.heroProgress)
         ctaButton = findViewById(R.id.ctaButton)
         ctaIcon = findViewById(R.id.ctaIcon)
@@ -923,6 +926,7 @@ class MainActivity : AppCompatActivity() {
         }
         updateConnectedSubline()
         updateHeroStats()
+        updateDisplayResolutionNote()
         updateAudioTag()
         updateReadyRow()
         updateDeviceSubtitle()
@@ -933,9 +937,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * 当前真正在用的码流尺寸。
+     *
+     * 直通模式下由 CarLife 引擎决定，而且**会变**：会话建立时引擎往往还停在默认
+     * 1280×720，收到车机分辨率（98311）之后才重建编码器。所以这里每次现取，
+     * 不能只记建链那一刻的快照——否则界面会一直显示临时值。
+     */
+    private fun effectiveStreamSize(): Pair<Int, Int>? {
+        if (CarLifeHijack.isAttached || CarLifeHijack.isActive) {
+            val (w, h) = CarLifeHijack.videoSize
+            if (w > 0 && h > 0) return w to h
+        }
+        val w = SessionController.activeStreamWidth
+        val h = SessionController.activeStreamHeight
+        return if (w > 0 && h > 0) w to h else null
+    }
+
+    /**
      * 英雄卡统计行（仅连接时显示）：运行时分辨率 + 实测帧率。
      * 实际帧率 = 1s 轮询对已发帧计数取差值；新会话计数归零时先对齐基线。
      * 目标帧率不再展示（固定 60，见 [DisplayPrefs.FPS]），只报实测值。
+     *
+     * 分辨率报**像素**，不再是「100%」这种只有自己看得懂的比例：车机原值在前，
+     * 码流与它不一致时用 `→` 接实际值（直通模式由 CarLife 引擎定尺寸）。
      */
     private fun updateHeroStats() {
         if (heroState != HeroState.CONNECTED) return
@@ -943,9 +967,61 @@ class MainActivity : AppCompatActivity() {
         if (sent < lastSentFrames) lastSentFrames = sent
         val fps = sent - lastSentFrames
         lastSentFrames = sent
-        heroStats.text =
-            "分辨率 ${SessionController.activeScalePercent}% · " +
-            "$fps fps"
+        val carW = SessionController.activeCarWidth
+        val carH = SessionController.activeCarHeight
+        val stream = effectiveStreamSize()
+        val resolution =
+            when {
+                carW <= 0 -> "—"
+                !SessionController.activeCarResolutionFromCar -> {
+                    // 车机没回 /info：这个值其实是手机横屏兜底，必须标明
+                    "${carW}×$carH（手机兜底）"
+                }
+                stream == null || (stream.first == carW && stream.second == carH) -> "$carW×$carH"
+                else -> "$carW×$carH → ${stream.first}×${stream.second}"
+            }
+        heroStats.text = "分辨率 $resolution · $fps fps"
+    }
+
+    /**
+     * 「显示」卡片里的分辨率行。
+     *
+     * 连接中显示本会话快照（车机 AirPlay `/info` 通告的原值 + 实际码流尺寸）；
+     * 没连接时回落到上一次会话的落盘快照——车机分辨率只有 SETUP 之后才知道，
+     * 不落盘的话断连状态永远是一片空白，用户没法核对「到底按多大在推」。
+     */
+    private fun updateDisplayResolutionNote() {
+        val target = displayResolutionNote
+        val running = SessionController.videoSender?.isRunning == true
+        val text =
+            if (running && SessionController.activeCarWidth > 0) {
+                val carW = SessionController.activeCarWidth
+                val carH = SessionController.activeCarHeight
+                val stream = effectiveStreamSize()
+                if (!SessionController.activeCarResolutionFromCar) {
+                    "⚑ 车机未通告分辨率 · 按手机横屏 $carW×$carH 兜底"
+                } else if (stream != null && (stream.first != carW || stream.second != carH)) {
+                    "车机 $carW×$carH · 码流 ${stream.first}×${stream.second}（由 CarLife 引擎定尺寸）"
+                } else {
+                    "车机 $carW×$carH · 码流同尺寸"
+                }
+            } else {
+                val last = DisplayPrefs.lastSession(this)
+                val streamDiffers =
+                    last != null &&
+                        last.streamWidth > 0 &&
+                        (last.streamWidth != last.carWidth || last.streamHeight != last.carHeight)
+                when {
+                    last == null -> "连接后自动读取车机分辨率"
+                    !last.carFromCar ->
+                        "上次：车机未通告 · 按手机横屏 ${last.carWidth}×${last.carHeight} 兜底"
+                    streamDiffers ->
+                        "上次：车机 ${last.carWidth}×${last.carHeight} · " +
+                            "码流 ${last.streamWidth}×${last.streamHeight}"
+                    else -> "上次：车机 ${last.carWidth}×${last.carHeight}"
+                }
+            }
+        if (target.text != text) target.text = text
     }
 
     private fun applyHeroState(s: HeroState) {
@@ -1105,11 +1181,28 @@ class MainActivity : AppCompatActivity() {
 
         fun refreshScaleNote() {
             val runningNow = SessionController.videoSender?.isRunning == true
-            scaleNote.text =
-                if (runningNow) {
-                    "保存后下次连接起效；当前连接按 ${SessionController.activeScalePercent}% 运行"
+            val percent = DisplayPrefs.scalePercent(ctx)
+            // 百分比单独摆着没有信息量：顺手换算成像素（与 SessionController 同一套
+            // 偶数对齐、最小边限制），用户一眼能看出「120% 到底是多少」。
+            val car =
+                if (runningNow && SessionController.activeCarWidth > 0) {
+                    SessionController.activeCarWidth to SessionController.activeCarHeight
                 } else {
-                    "保存后下次连接起效"
+                    DisplayPrefs.lastSession(ctx)?.let { it.carWidth to it.carHeight }
+                }
+            val mapped =
+                car?.let { (w, h) ->
+                    val sw = ((w * percent / 100f).toInt().coerceAtLeast(320) / 2) * 2
+                    val sh = ((h * percent / 100f).toInt().coerceAtLeast(180) / 2) * 2
+                    "$percent% ≈ ${sw}×$sh"
+                }
+            scaleNote.text =
+                when {
+                    runningNow ->
+                        "保存后下次连接起效；当前连接按 ${SessionController.activeScalePercent}% 运行" +
+                            (mapped?.let { "（$it）" } ?: "")
+                    mapped != null -> "保存后下次连接起效 · $mapped"
+                    else -> "保存后下次连接起效"
                 }
         }
         refreshScaleNote()

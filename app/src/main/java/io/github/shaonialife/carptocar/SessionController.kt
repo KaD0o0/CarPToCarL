@@ -402,6 +402,33 @@ object SessionController {
     @Volatile
     var activeTargetFps: Int = DisplayPrefs.FPS
 
+    // ---- 本会话分辨率（英雄卡 / 显示卡片展示，均为会话建立时的快照）----
+
+    /** 车机通告的屏幕宽（`/info displays[0].widthPixels`；0 = 还没连过）。 */
+    @Volatile
+    var activeCarWidth: Int = 0
+
+    /** 车机通告的屏幕高。 */
+    @Volatile
+    var activeCarHeight: Int = 0
+
+    /**
+     * 车机分辨率是否真的来自车机。
+     *
+     * false = 车机没回 `/info` displays，[activeCarWidth]/[activeCarHeight] 是手机横屏兜底值，
+     * UI 必须照实标注——把兜底值当车机参数展示，会让人误判「车机就是竖屏/小屏」。
+     */
+    @Volatile
+    var activeCarResolutionFromCar: Boolean = false
+
+    /** 本会话真正上线的码流宽（直通模式下取 CarLife 引擎实际编码尺寸）。 */
+    @Volatile
+    var activeStreamWidth: Int = 0
+
+    /** 本会话真正上线的码流高。 */
+    @Volatile
+    var activeStreamHeight: Int = 0
+
     @Volatile
     var audioSender: AudioSender? = null
 
@@ -2549,6 +2576,11 @@ object SessionController {
                                         ((setup.displayHeight * scale).toInt().coerceAtLeast(180) / 2) * 2
                                     activeScalePercent = scalePct
                                     activeTargetFps = DisplayPrefs.FPS
+                                    // 记录「车机通告分辨率」原值：英雄卡与「显示」卡片要如实
+                                    // 展示它，而不是只显示缩放百分比（用户根本看不出画布多大）。
+                                    activeCarWidth = setup.displayWidth
+                                    activeCarHeight = setup.displayHeight
+                                    activeCarResolutionFromCar = setup.displayFromCar
                                     // 车机触摸在通告视图坐标系（如 1160×540），流已按比例
                                     // 缩放（如 1450×674）——注入前需映射，否则点击漂移
                                     TouchRouter
@@ -2566,10 +2598,6 @@ object SessionController {
                                     CarLifeHijack.setRequestedResolution(
                                         setup.displayWidth,
                                         setup.displayHeight,
-                                    )
-                                    appendLog(
-                                        "DISPLAY: 流 ${setup.displayWidth}x${setup.displayHeight} → " +
-                                            "${streamW}x$streamH（$scalePct%）@${DisplayPrefs.FPS}fps",
                                     )
                                     pendingVideoW = streamW
                                     pendingVideoH = streamH
@@ -2592,10 +2620,41 @@ object SessionController {
                                         val (carW, carH) = CarLifeHijack.videoSize
                                         streamOutW = ((carW.coerceAtLeast(320)) / 2) * 2
                                         streamOutH = ((carH.coerceAtLeast(180)) / 2) * 2
-                                        appendLog("DISPLAY: CarLife 直通流 ${streamOutW}x$streamOutH")
                                     } else {
                                         streamOutW = streamW
                                         streamOutH = streamH
+                                    }
+                                    // 真正上线的码流尺寸（直通模式下与申请值可能不同）：
+                                    // 英雄卡与「显示」卡片显示的就是它，不是申请值。
+                                    activeStreamWidth = streamOutW
+                                    activeStreamHeight = streamOutH
+                                    appendLog(
+                                        "DISPLAY: 车机 ${setup.displayWidth}×${setup.displayHeight}" +
+                                            (if (setup.displayFromCar) {
+                                                "（/info 通告）"
+                                            } else {
+                                                "（车机未通告·手机横屏兜底）"
+                                            }) +
+                                            " → 流 ${streamOutW}×${streamOutH}（$scalePct%）@${DisplayPrefs.FPS}fps",
+                                    )
+                                    if (streamOutW != streamW || streamOutH != streamH) {
+                                        appendLog(
+                                            "DISPLAY: 码流尺寸由 CarLife 引擎决定（申请 " +
+                                                "${streamW}×$streamH，建链时刻 ${streamOutW}×$streamOutH）" +
+                                                "——引擎收到车机分辨率后会重建编码器，实际尺寸以界面显示为准",
+                                        )
+                                    }
+                                    // 落盘：下次还没连上时，界面也能显示「上次车机分辨率」，
+                                    // 而不是一片空白（用户问的就是「分辨率能不能从车机端看到」）。
+                                    appContext?.let { ctx ->
+                                        DisplayPrefs.recordSession(
+                                            ctx,
+                                            setup.displayWidth,
+                                            setup.displayHeight,
+                                            setup.displayFromCar,
+                                            streamOutW,
+                                            streamOutH,
+                                        )
                                     }
                                     videoSender =
                                         VideoSender(
