@@ -11,12 +11,12 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.Uri
-import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.text.method.ScrollingMovementMethod
 import android.view.View
 import android.widget.EditText
@@ -33,6 +33,7 @@ import androidx.core.graphics.drawable.DrawableCompat
 import io.github.shaonialife.carptocar.bt.BtProfiles
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
+import io.github.shaonialife.carptocar.input.CarInputClient
 import io.github.shaonialife.carptocar.input.TouchRouter
 import io.github.shaonialife.carptocar.launcher.VirtualLauncher
 import io.github.shaonialife.carptocar.launcher.settings.AppOrientationCompat
@@ -41,17 +42,14 @@ import io.github.shaonialife.carptocar.launcher.settings.DisplayPrefs
 import io.github.shaonialife.carptocar.legal.DisclaimerDialog
 import io.github.shaonialife.carptocar.legal.DisclaimerPrefs
 import io.github.shaonialife.carptocar.legal.needsDisclaimerAtLaunch
-import io.github.shaonialife.carptocar.media.NotificationAccess
-import io.github.shaonialife.carptocar.service.CarPlayService
-import io.github.shaonialife.carptocar.input.CarInputClient
-import io.github.shaonialife.carptocar.util.SysShell
-import io.github.shaonialife.carptocar.util.DeviceIdentity
 import io.github.shaonialife.carptocar.ui.DarkMessageDialog
 import io.github.shaonialife.carptocar.ui.PanelWindow
 import io.github.shaonialife.carptocar.ui.ScreenDimmer
 import io.github.shaonialife.carptocar.ui.SignalWavesView
 import io.github.shaonialife.carptocar.util.Bg
+import io.github.shaonialife.carptocar.util.DeviceIdentity
 import io.github.shaonialife.carptocar.util.LogExporter
+import io.github.shaonialife.carptocar.util.SysShell
 import java.util.Locale
 
 /**
@@ -278,6 +276,20 @@ class MainActivity : AppCompatActivity() {
      */
     private fun ensureWifiLocationReady(onReady: () -> Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+：应用专属网络（WifiNetworkSpecifier）与 WiFi 建议
+            // （WifiNetworkSuggestion）**都**要求 NEARBY_WIFI_DEVICES 运行时权限。
+            // 旧实现以为 13+ 不需要就原地放行——结果 requestNetwork 在无权限时
+            // 静默挂起：既不回调 onAvailable 也不回调 onUnavailable，也不抛异常。
+            // 2026-10-29 BMW iD9 日志里连续 8 轮「发起加入后一条日志都没有」
+            // 就是这个形态，必须在这里前置拦截。
+            val granted =
+                ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) ==
+                    PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                pendingStartAfterLocationPermission.set(true)
+                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+                return
+            }
             onReady()
             return
         }
@@ -330,6 +342,18 @@ class MainActivity : AppCompatActivity() {
     private val locationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             log("ACCESS_FINE_LOCATION 授权: $granted")
+            if (granted && pendingStartAfterLocationPermission.compareAndSet(true, false)) {
+                proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
+            }
+        }
+
+    /** Android 13+ 的 NEARBY_WIFI_DEVICES 授权后自动续跑（与位置权限共用同一 pending 标志）。 */
+    private val nearbyWifiPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            log(
+                "NEARBY_WIFI_DEVICES 授权: $granted" +
+                    if (granted) "" else "——无法加入车机热点，请到「设置 > 应用 > 权限 > 附近的设备」授予",
+            )
             if (granted && pendingStartAfterLocationPermission.compareAndSet(true, false)) {
                 proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
             }
@@ -1045,6 +1069,7 @@ class MainActivity : AppCompatActivity() {
         val hijackSwitch = findViewById<SwitchCompat>(R.id.switchCarLifeHijack)
         val hijackNote = findViewById<TextView>(R.id.carLifeHijackNote)
         hijackSwitch.isChecked = CarLifeHijack.isEnabled(ctx)
+
         fun refreshHijackNote() {
             val running = CarLifeHijack.isActive
             hijackNote.text =
@@ -1756,7 +1781,6 @@ class MainActivity : AppCompatActivity() {
         val text = deviceName()
         if (deviceSubtitle.text != text) deviceSubtitle.text = text
     }
-
 
     // ==================== 通用 UI 工具 ====================
 

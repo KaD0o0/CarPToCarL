@@ -34,11 +34,11 @@ import io.github.shaonialife.carptocar.net.EndpointHosts
 import io.github.shaonialife.carptocar.net.WifiCarPlayConnector
 import io.github.shaonialife.carptocar.net.WifiSavedNetworks
 import io.github.shaonialife.carptocar.service.CarPlayService
-import io.github.shaonialife.carptocar.util.SysShell
 import io.github.shaonialife.carptocar.ui.ScreenDimmer
 import io.github.shaonialife.carptocar.util.Bg
 import io.github.shaonialife.carptocar.util.DebugFileLog
 import io.github.shaonialife.carptocar.util.SessionTrace
+import io.github.shaonialife.carptocar.util.SysShell
 import io.github.shaonialife.carptocar.video.VideoSender
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -129,10 +129,20 @@ object SessionController {
     private const val WIFI_BIND_WAIT_S = 15L
 
     /**
-     * 等用户确认「连接车机热点」系统弹窗的上限（应用专属网络）。
-     * 系统确认框可能停留很久；用户取消连接时 [connectCancelled] 会即时退出。
+     * 等应用专属网络（`WifiNetworkSpecifier`）确认框的上限。
+     *
+     * **必须与车机的等待窗口对齐**：BMW iD9（IDC23）实测在交出 0x4301 后约 27 秒
+     * 就拆蓝牙链（2026-10-29，连续 6 轮 25~28s）。旧值 120s 意味着每轮都要白等到
+     * 车机先放弃，期间还会叠上下一轮的新请求（旧线程仍在 latch 上转），表现成
+     * 「连上就闪退 + 后续越连越连不上」。15s 留出车机窗口内再试一次的余地。
      */
-    private const val SPECIFIER_JOIN_TIMEOUT_MS = 120_000L
+    private const val SPECIFIER_JOIN_TIMEOUT_MS = 15_000L
+
+    /**
+     * 建议网络（[registerSuggestion]）生效后，等系统自动关联车机热点的上限。
+     * 建议已被用户授权时系统通常 1~3 秒内就连上，比 specifier 快且无弹框。
+     */
+    private const val SUGGESTION_JOIN_WAIT_MS = 8_000L
 
     /** Activity onCreate 时调用：登记 applicationContext 并创建会话对象（幂等）。 */
     fun ensure(context: Context) {
@@ -266,10 +276,16 @@ object SessionController {
                 album = null, // MediaSession 未单独暴露专辑名，这里留空
                 durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                 status =
-                    if (session.playing) Iap2NowPlaying.STATUS_PLAYING
-                    else Iap2NowPlaying.STATUS_PAUSED,
-                elapsedMs = session.displayPositionAt(android.os.SystemClock.elapsedRealtime())
-                    .coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    if (session.playing) {
+                        Iap2NowPlaying.STATUS_PLAYING
+                    } else {
+                        Iap2NowPlaying.STATUS_PAUSED
+                    },
+                elapsedMs =
+                    session
+                        .displayPositionAt(android.os.SystemClock.elapsedRealtime())
+                        .coerceAtMost(Int.MAX_VALUE.toLong())
+                        .toInt(),
                 appName = session.pkg,
             )
         }
@@ -388,6 +404,7 @@ object SessionController {
 
     @Volatile
     var audioSender: AudioSender? = null
+
     @Volatile
     var currentClient: AirPlayClient? = null
 
@@ -799,6 +816,10 @@ object SessionController {
             // 1) WLAN 开关。shell 不可用时跳过检查——requestNetwork 会以 Unavailable 反馈。
             if (shellReady && shellWifiDisabled() && !waitForWifiEnabled()) return@run
             if (connectCancelled) return@run
+            // 1.5) 登记 WiFi 建议（幂等）：用户授权过一次后，系统会自己把手机连上
+            // 车机热点，后续不再出现「连接到此网络？」确认框——这是无人点屏场景的
+            // 唯一可行路径（BMW iD9 只给 27s，人来不及点就断链）。
+            wifiConnector?.registerSuggestion(wifi.ssid, wifi.passphrase, wifi.securityType)
             // 2) 首选应用专属网络（不影响 4G/5G、不会被系统切回、不需要任何特权）
             when (val result = joinCarWifiSpecifier(wifi, shellReady)) {
                 is WifiCarPlayConnector.JoinResult.Joined -> Unit
@@ -857,8 +878,14 @@ object SessionController {
             // 关键时机：bindProcessToNetwork 完成后再注册，车机才能看到 ctrl 广播
             ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
             appendLog(">>> WiFi 已加入车机热点（应用专属网络），ctrl 广播已重新注册，等待车机 ctrl 邀请")
-        } else if (!connectCancelled) {
-            appendLog("WIFI: 应用专属网络加入未成功（${result.javaClass.simpleName}）")
+        } else {
+            // 取消态也必须留痕：旧实现用 `if (!connectCancelled)` 把失败日志挡掉，
+            // 于是「车机 27s 超时掐断 BT → 本轮加入被静默取消」在日志里完全消失，
+            // 现场只剩「发起加入」一行、后面什么都没有，根本无从判断卡在哪一步。
+            appendLog(
+                "WIFI: 应用专属网络加入未成功（${result.javaClass.simpleName}）" +
+                    if (connectCancelled) "——本轮已被取消（车机链路已断开），下一轮重来" else "",
+            )
         }
         return result
     }
@@ -2043,6 +2070,10 @@ object SessionController {
         )
         phaseHint = "蓝牙已连上车机，解析热点地址…"
         ssidSink?.invoke(endpoint.ssid)
+        // 0x4301 同样带热点密码（BMW iD9 不发 0x5703，AP 信息只走这条路）。
+        // 不缓存的话首页「WiFi」按钮会判成「尚未拿到热点密码」，用户连手动加入
+        // 都做不了——2026-10-29 日志里连着出现三次这条误导性提示，根因就是这里。
+        if (endpoint.passphrase.isNotEmpty()) lastWifiPsk = endpoint.passphrase
         // 诊断（老车机排查必看）：地址是 IPv4 还是只有 IPv6、TXT features 是否声明配对能力。
         // 奥迪 4xxx 两种「连不上」都源于这里——旧版日志里完全没有这两项。
         val addresses = endpoint.ipAddresses
@@ -2580,11 +2611,12 @@ object SessionController {
                                             // 此刻 CarLife 客户端可能还没握手完成（构造值只是
                                             // 默认 1280×720），等引擎按车机真实分辨率重建编码器后，
                                             // 这里每次发 config 都会取到最新值，声明永远与码流一致。
-                                            liveSize = if (hijackMode) {
-                                                { CarLifeHijack.videoSize }
-                                            } else {
-                                                null
-                                            },
+                                            liveSize =
+                                                if (hijackMode) {
+                                                    { CarLifeHijack.videoSize }
+                                                } else {
+                                                    null
+                                                },
                                             onEnded = {
                                                 // 会话真实结束：解除静默降噪（客户端恢复探测/重连）
                                                 appendLog(">>> CarPlay 会话结束（推流终止）——恢复蓝牙探测")
@@ -2707,6 +2739,12 @@ object SessionController {
             // 不能再用「按 TRANSPORT_WIFI 盲绑当前任意 WiFi」——切网途中会绑到旧网络，
             // AirPlay 必然连不上，且会把无互联网热点留在系统默认网络里。
             Bg.run("wifi-join-on-endpoint") {
+                // 第一步永远是登记「WiFi 建议」——幂等、不等结果、不弹框。
+                // 用户授权过一次之后，系统会在进入范围时自动关联车机热点，
+                // 届时下面那条 specifier 请求会立刻拿到 onAvailable（网络已存在，
+                // 系统不再要求确认），整条链路才能真正做到「上车即连」。
+                val connector = wifiConnector
+                connector?.registerSuggestion(wifiConfig.ssid, wifiConfig.passphrase, wifiConfig.securityType)
                 while (!connectCancelled) {
                     // Shizuku 已移除：没有 shell 特权。
                     val shellReady = false
@@ -2725,6 +2763,27 @@ object SessionController {
                         }
 
                         WifiCarPlayConnector.JoinResult.Unavailable -> {
+                            // specifier 没进来时，建议网络可能已经在后台把手机连上了
+                            // （用户授权过 suggestion，但系统关联比我们的 15s 窗口慢）。
+                            // 这里再给建议通道一个短窗口：真连上了就直接绑，省掉弹窗。
+                            val bySuggestion =
+                                if (connector != null && !connectCancelled) {
+                                    connector.bindCurrentWifiBlocking(SUGGESTION_JOIN_WAIT_MS) { connectCancelled }
+                                } else {
+                                    null
+                                }
+                            if (bySuggestion != null) {
+                                boundCarSsid = wifiConfig.ssid
+                                phaseHint = "已加入车机热点"
+                                ctrlAdvertiser?.ensureForNetwork(
+                                    wifiConfig.ssid,
+                                    force = true,
+                                    network = connector?.currentNetwork,
+                                )
+                                appendLog(">>> WiFi 由系统自动连上（热点建议生效，无需确认框），ctrl 广播已重新注册")
+                                continueWithNetwork(true)
+                                return@run
+                            }
                             promptSpecifierFailed(wifiConfig, shellReady)
                             // promptSpecifierFailed 内部可能已重试/转手动；两者都会
                             // 通过 joinCarWifiSpecifier → continueWithNetwork 续上流程，
