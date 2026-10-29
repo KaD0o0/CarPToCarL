@@ -55,6 +55,16 @@ class VirtualIap2Link(
      * 注入（数据源 = CarLife 内置播放器经 0x10035 推来的歌名，见 CarLifeHijack）。
      */
     private val nowPlayingProvider: (() -> CarPlayNowPlaying?)? = null,
+    /**
+     * 当前通话状态提供者（iAP2 `CallState`：0=无通话、1=来电、2=拨出、3=通话中）。
+     *
+     * 0x4154（StartCallStateUpdates）订阅到达时用它回**真实值**。恒回 0 的后果不是
+     * 「少一个功能」而是「车机认定这台手机永远不打电话」——通话时它不会切通话 UI，
+     * 也不会把音频通路让给 telephony 档（2026-10-29 通话适配）。
+     *
+     * 由 SessionController 注入（数据源 = `AudioManager.mode`，见 `callStateOf`）。
+     */
+    private val callStateProvider: (() -> Int)? = null,
 ) {
     private val lock = Any()
     private val engine = Iap2LinkEngine()
@@ -211,6 +221,33 @@ class VirtualIap2Link(
                     " 歌手=${nowPlaying.artist ?: "?"}）",
             )
         }
+    }
+
+    /**
+     * 通话状态变化时主动补推 0x4155。
+     *
+     * 调用时机有讲究（[SessionController.switchAudioScene] 负责顺序）：**先把 telephony
+     * 音频档 SETUP 好，再推状态**。车机收到「通话中」会立刻把音频路由切到通话通路，
+     * 此时若通话流还没建，它切过去只能拿到一条空的媒体流——「车机显示通话中却没有声音」
+     * 正是这个顺序错的典型症状。
+     */
+    fun pushCallState() {
+        synchronized(lock) {
+            if (!mib3Identified) return
+            val state = currentCallState()
+            sendCallStateLocked(state)
+            log("IAPLINK: 主动补推 0x4155（通话状态=$state）")
+        }
+    }
+
+    /** 当前通话状态（provider 缺省或越界一律回「无通话」，绝不发未知值给车机）。 */
+    private fun currentCallState(): Int =
+        (callStateProvider?.invoke() ?: IAP2_CALL_STATE_NONE)
+            .coerceIn(IAP2_CALL_STATE_NONE, IAP2_CALL_STATE_ACTIVE)
+
+    /** 发一条 0x4155（订阅应答与主动补推共用，保证两条路径的参数形态完全一致）。 */
+    private fun sendCallStateLocked(state: Int) {
+        sendCsmLocked(CALL_STATE_UPDATE, Iap2Csm.param(CALL_STATE_PARAM, byteArrayOf(state.toByte())))
     }
 
     /**
@@ -615,11 +652,13 @@ class VirtualIap2Link(
 
             START_CALL_STATE_UPDATES -> {
                 if (!mib3) return
-                sendCsmLocked(
-                    CALL_STATE_UPDATE,
-                    Iap2Csm.param(0x0002, byteArrayOf(0)),
+                // 车机会一直把订阅时的答案当「当前状态」，之后靠主动补推更新。
+                val state = currentCallState()
+                sendCallStateLocked(state)
+                log(
+                    "IAPLINK: MIB3 0x4154 → 0x4155（通话状态=$state" +
+                        (if (state == IAP2_CALL_STATE_NONE) " 无通话" else "") + "）",
                 )
-                log("IAPLINK: MIB3 0x4154 → 0x4155（无通话）")
             }
 
             START_LIST_UPDATES -> {
@@ -936,6 +975,21 @@ class VirtualIap2Link(
         const val START_COMMUNICATIONS_UPDATES = 0x4157
         const val CALL_STATE_UPDATE = 0x4155
         const val START_CALL_STATE_UPDATES = 0x4154
+
+        /** 0x4155 里承载通话状态的参数号（MIB3 空态实测就是这个号，值 1 字节）。 */
+        const val CALL_STATE_PARAM = 0x0002
+
+        /** iAP2 CallState：无通话。 */
+        const val IAP2_CALL_STATE_NONE = 0
+
+        /** iAP2 CallState：来电（车机据此显示来电界面）。 */
+        const val IAP2_CALL_STATE_INCOMING = 1
+
+        /** iAP2 CallState：拨出。 */
+        const val IAP2_CALL_STATE_OUTGOING = 2
+
+        /** iAP2 CallState：通话已建立。 */
+        const val IAP2_CALL_STATE_ACTIVE = 3
         const val START_LIST_UPDATES = 0x4170
         const val LIST_UPDATE = 0x4171
 

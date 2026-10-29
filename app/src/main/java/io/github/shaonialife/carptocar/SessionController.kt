@@ -4,6 +4,7 @@ import android.content.Context
 import android.view.KeyEvent
 import io.github.shaonialife.carptocar.airplay.AirPlayClient
 import io.github.shaonialife.carptocar.airplay.PairVerifyClient
+import io.github.shaonialife.carptocar.airplay.VirtualIap2Link
 import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioProfileMemory
 import io.github.shaonialife.carptocar.audio.AudioSender
@@ -464,6 +465,26 @@ object SessionController {
     @Volatile
     private var activeAudioProfile: AudioProfile? = null
 
+    /**
+     * 当前音频流是否处在**通话场景**（`audioType=telephony` 档）。
+     *
+     * 通话与媒体在接收端是两条**不同的输出设备**：车机收到 telephony 档的流才会打开
+     * 通话增益与麦克风通路。所以进/出通话都要换一次流，只调音量是没用的。
+     */
+    @Volatile
+    private var audioInCallMode: Boolean = false
+
+    /** 本次通话真正切上的通话档（null = 没切过 / 车机未声明 telephony）。 */
+    @Volatile
+    private var activeCallProfile: AudioProfile? = null
+
+    /**
+     * 已被拒过的通话档键：同一次通话里不重复撞同一档。
+     * SETUP 往返最长 8 秒，撞两遍就白等 16 秒——而通话场景本来就只有几十秒。
+     */
+    @Volatile
+    private var rejectedCallProfileKey: String? = null
+
     /** 音频档位记忆的键（车机身份文本，见 [AirPlayClient.receiverIdentity]）。 */
     @Volatile
     private var activeAudioReceiverKey: String = ""
@@ -756,6 +777,11 @@ object SessionController {
         ScreenDimmer.setSessionActive(false)
         audioSender?.stop()
         audioSender = null
+        // 通话场景标记必须随会话清掉：留着的话下一轮会被当成「已经在通话档」，
+        // 进入通话时 switchAudioScene 直接返回 true，一条通话流都不会建。
+        audioInCallMode = false
+        activeCallProfile = null
+        rejectedCallProfileKey = null
         currentSharedSecret = null
         currentAudioHost = null
         currentHiddenSource?.release()
@@ -1576,7 +1602,7 @@ object SessionController {
                 activeAudioStartedAt = 0L
                 false
             } else {
-                startCallWatcher(sender)
+                startCallWatcher()
                 true
             }
         } catch (error: Exception) {
@@ -1629,8 +1655,9 @@ object SessionController {
         // 新流已就绪：停旧发送端。旧流不再有包，接收端会在超时后自行回收。
         old.stop()
         audioSender = null
-        // 旧看门狗线程因 sender.isRunning=false 自行退出；置空后下一行才能重新挂载。
-        callWatcher = null
+        // 看门狗线程跟随 audioSender 字段：换流后自动续上，所以这里**不该**置
+        // callWatcher = null —— 那只丢引用、旧线程仍在跑，紧接着 startCallWatcher()
+        // 再起一个就成双线程（两边同时切音频流）。startCallWatcher 自己有 isAlive 检查。
         val sender =
             AudioSender(
                 host = host,
@@ -1652,7 +1679,7 @@ object SessionController {
             return false
         }
         activeAudioStartedAt = android.os.SystemClock.uptimeMillis()
-        startCallWatcher(sender)
+        startCallWatcher()
         // 新流是在「会话已激活」之后加入的：按 AirPlay 语义必须补发 RECORD 纳入会话，
         // 否则车机对 SETUP 回 200、给端口，但不排播（见 startAudioChannel 同名注释）。
         client.record()
@@ -1662,6 +1689,136 @@ object SessionController {
         )
         return true
     }
+
+    /**
+     * 按场景**换一条音频流**（媒体档 ↔ 通话档），先建新的、成功了才停旧的。
+     *
+     * 为什么必须换流而不是改参数：`audioType` 只在 SETUP 里出现一次，一条流建成后
+     * 无法中途改变语义。车机把 media / telephony 当**两台不同的输出设备**——这也是
+     * 通话在车机上没声音的根本原因（媒体流一直占着媒体通路，通话通路从没被打开）。
+     *
+     * 顺序沿用 [rebuildAudioChannel] 的约定：新流 SETUP 成功后才停旧流，SETUP 被拒时
+     * 旧流仍在推，绝不把「本来有声音」搞成「彻底没声」。成功后补一次 RECORD，
+     * 否则车机对后加入的流只给端口不排播。
+     *
+     * 音源**不变**：CarLife 引擎的 PCM 还是喂给 [AudioSender]，只是接收端换了输出通路
+     * （[CarLifeAudioSink] 取的是 `SessionController.audioSender`，换字段即生效）。
+     *
+     * @return 是否真的切过去了（false = 保持原流，调用方据此决定兜底动作）
+     */
+    @Synchronized
+    private fun switchAudioScene(
+        inCall: Boolean,
+        reason: String,
+    ): Boolean {
+        if (audioInCallMode == inCall) return true
+        val client = currentClient ?: return false
+        val secret = currentSharedSecret ?: return false
+        val host = currentAudioHost ?: return false
+        val context = appContext?.applicationContext ?: return false
+        val old = audioSender ?: return false
+        if (!old.isRunning) return false
+        val target: AudioProfile? =
+            if (inCall) {
+                val candidates = client.callCandidates()
+                if (candidates.isEmpty()) {
+                    // 车机没声明 telephony：没有通话通路可切。这不是失败，是这台车就不支持
+                    // ——硬用媒体档顶替只会得到怪声（见 AudioProfile 注释）。
+                    appendLog("AUDIO: $reason → 车机未声明通话音频档（telephony），保持媒体流（通话声音仍在本机）")
+                    return false
+                }
+                val chosen = candidates.firstOrNull { it.key != rejectedCallProfileKey } ?: candidates.first()
+                // 上行能力只做**诊断**（2026-10-29）：真正的麦克风上行流要用我们自己的
+                // UDP 监听端口换车机推流，端口/密钥语义与下行不同，没有车机日志无法确认
+                // 方向。先把结论落到日志：有候选说明车机声明了 PCM 输入位，下一轮才有依据。
+                val mic = client.microphoneCandidates()
+                val micText =
+                    if (mic.isEmpty()) {
+                        "车机 telephony 档未声明 PCM 输入位（无上行流可建）"
+                    } else {
+                        mic.joinToString(" ") { it.label }
+                    }
+                appendLog("AUDIO: 麦克风上行能力=$micText；本次下行用 ${chosen.label}")
+                chosen
+            } else {
+                activeAudioProfile
+            }
+        if (target == null) {
+            appendLog("AUDIO: $reason → 没有可用的${if (inCall) "通话" else "媒体"}档，保持当前流")
+            return false
+        }
+        appendLog(
+            "AUDIO: $reason → 音频流切换 ${if (inCall) "媒体→通话" else "通话→媒体"}（${target.label}）",
+        )
+        val info =
+            try {
+                client.runAudioStream(secret, target, AudioTuning.RAW_SPF)
+            } catch (error: Exception) {
+                appendLog("AUDIO: 切换协商异常 - ${error.message}")
+                null
+            }
+        if (info == null) {
+            if (inCall) rejectedCallProfileKey = target.key
+            appendLog("AUDIO: 切到 ${target.label} 失败——保持原音频流继续推（不降级成无声）")
+            return false
+        }
+        // 新流已就绪：停旧流。旧流不再有包，接收端会在超时后自行回收。
+        old.stop()
+        audioSender = null
+        val sender =
+            AudioSender(
+                host = host,
+                dataPort = info.dataPort,
+                streamKey = info.streamKey,
+                log = { line -> appendLog(line) },
+                context = context,
+                sampleRate = info.sampleRate,
+                codec = target.codec,
+                streamType = target.streamType,
+                adtsFrames = AudioTuning.RAW_SPF.adts,
+                controlPort = info.controlPort,
+            )
+        audioSender = sender
+        if (!sender.startPassthrough()) {
+            audioSender = null
+            appendLog("AUDIO: 切换后音频流启动失败——本段仅推视频（重连可恢复）")
+            return false
+        }
+        audioInCallMode = inCall
+        activeCallProfile = if (inCall) target else null
+        if (!inCall) rejectedCallProfileKey = null
+        // 新流是在「会话已激活」之后加入的：按 AirPlay 语义必须补发 RECORD 纳入会话，
+        // 否则车机对 SETUP 回 200、给端口，但不排播。
+        client.record()
+        appendLog(
+            "AUDIO: 音频流已切到 ${target.label}（dataPort=${info.dataPort} " +
+                "controlPort=${info.controlPort}）——音源不变，只换了接收端输出通路",
+        )
+        // 通话档建好**之后**才告诉车机「正在通话」：顺序反了它会切到一条还没建的流上。
+        if (inCall) runCatching { client.pushCallState() }
+        return true
+    }
+
+    /**
+     * 当前通话状态（iAP2 `CallState`），由 `AudioManager.mode` 反推。
+     *
+     * 只区分「正在通话」与「无通话」：这两种都不会误报。`RINGTONE` 与 `IN_CALL` 一起
+     * 归为通话通路被占用——车机据此把音频路由让给 telephony 档。
+     * 面板来电/去电的区分依赖 `READ_PHONE_STATE` + 通话 App，不在本层职责内。
+     */
+    private fun callStateOf(): Int {
+        val manager =
+            appContext?.applicationContext?.getSystemService(Context.AUDIO_SERVICE)
+                as? android.media.AudioManager ?: return VirtualIap2Link.IAP2_CALL_STATE_NONE
+        return when (manager.mode) {
+            android.media.AudioManager.MODE_RINGTONE -> VirtualIap2Link.IAP2_CALL_STATE_INCOMING
+            android.media.AudioManager.MODE_IN_CALL,
+            android.media.AudioManager.MODE_IN_COMMUNICATION,
+            -> VirtualIap2Link.IAP2_CALL_STATE_ACTIVE
+            else -> VirtualIap2Link.IAP2_CALL_STATE_NONE
+        }
+    }
+
 
     /** 延迟 2.5 秒再重建：让车机先把通话通路的资源收干净，避免两边抢音频设备。 */
     private fun scheduleAudioRebuild() {
@@ -1692,7 +1849,7 @@ object SessionController {
      * （IN_CALL / IN_COMMUNICATION / RINGTONE → NORMAL）时补两件事：
      * ① 重新核对并纠正车机音量；② 补一轮同步包重锚。两者都幂等，失败只记日志。
      */
-    private fun startCallWatcher(sender: AudioSender) {
+    private fun startCallWatcher() {
         if (callWatcher?.isAlive == true) return
         val manager =
             appContext?.applicationContext?.getSystemService(Context.AUDIO_SERVICE)
@@ -1700,24 +1857,76 @@ object SessionController {
         callWatcher =
             Thread {
                 var lastMode = manager.mode
-                while (sender.isRunning) {
+                // 目标状态与连续计数：mode 在通话建立/挂断的瞬间会抖几下（IN_CALL → NORMAL
+                // → IN_COMMUNICATION），只认「连续 2 秒同向」才动手，避免来回换流。
+                var pendingInCall = isCallMode(lastMode)
+                var pendingTicks = 0
+                var idleTicks = 0
+                while (true) {
                     try {
                         Thread.sleep(1_000)
                     } catch (_: InterruptedException) {
                         return@Thread
                     }
+                    // 跟随字段而不是构造参数：换场景时 sender 会被整个换掉，
+                    // 看门狗得继续盯新的那条流，否则切换后这个线程直接退出。
+                    val sender = audioSender
+                    if (sender == null) {
+                        // 切换间隙（停旧 → 起新）也会短暂为 null：连续 3 次才算会话结束。
+                        if (++idleTicks >= 3) return@Thread
+                        continue
+                    }
+                    idleTicks = 0
+                    if (!sender.isRunning) return@Thread
                     val mode = manager.mode
-                    if (mode == lastMode) continue
-                    appendLog("AUDIO: 音频模式 ${audioModeName(lastMode)} → ${audioModeName(mode)}")
-                    if (isCallMode(lastMode) && !isCallMode(mode)) {
+                    if (mode != lastMode) {
+                        appendLog("AUDIO: 音频模式 ${audioModeName(lastMode)} → ${audioModeName(mode)}")
+                        lastMode = mode
+                    }
+                    val inCall = isCallMode(mode)
+                    if (inCall == audioInCallMode) {
+                        pendingTicks = 0
+                        continue
+                    }
+                    if (inCall != pendingInCall) {
+                        pendingInCall = inCall
+                        pendingTicks = 0
+                        continue
+                    }
+                    if (++pendingTicks < 2) continue
+                    pendingTicks = 0
+                    if (inCall) {
+                        appendLog("AUDIO: 进入通话（${audioModeName(mode)}）→ 换到通话音频档")
+                        val switched =
+                            runCatching { switchAudioScene(true, "进入通话") }.getOrElse {
+                                appendLog("AUDIO: 切换通话档异常 - ${it.message}")
+                                false
+                            }
+                        if (!switched) {
+                            appendLog("AUDIO: 通话档未切上——车机侧通话通路不会打开，通话声音仍在本机")
+                        }
+                    } else {
                         appendLog("AUDIO: 通话结束——重新核对车机音量并补同步包（车机常停在静音位）")
                         currentClient?.refreshVolume("通话结束")
                         sender.resyncAnchor("通话结束")
-                        // 音量/同步包都救不了「接收端输出设备被释放」这一种：
-                        // 再补一次「新建音频流」，才是重连一次就能好的等价动作。
-                        scheduleAudioRebuild()
+                        if (audioInCallMode) {
+                            val switched =
+                                runCatching { switchAudioScene(false, "通话结束") }.getOrElse {
+                                    appendLog("AUDIO: 切回媒体档异常 - ${it.message}")
+                                    false
+                                }
+                            if (switched) {
+                                runCatching { currentClient?.pushCallState() }
+                            } else {
+                                // 切不回去就按老办法重建媒体流：接收端在为通话释放过
+                                // 音频输出设备后，只有新建流才会重新打开。
+                                scheduleAudioRebuild()
+                            }
+                        } else {
+                            // 没切过通话档（车机未声明 telephony / 切换失败）：仍按老办法重建。
+                            scheduleAudioRebuild()
+                        }
                     }
-                    lastMode = mode
                 }
             }.apply {
                 isDaemon = true
@@ -1756,6 +1965,17 @@ object SessionController {
         val profile = activeAudioProfile ?: return
         val startedAt = activeAudioStartedAt
         val identity = activeAudioReceiverKey
+        // 通话中拆链不能算到媒体档头上：这段时间上线的是通话档（audioType=telephony），
+        // 两条流在接收端是不同设备，把责任记到媒体档会让它下次被跳过。
+        if (audioInCallMode) {
+            appendLog(
+                "AUDIO: 通话档在线期间会话被拆——不归因到媒体档 ${profile.label}" +
+                    (activeCallProfile?.let { "（通话档 ${it.label}）" } ?: ""),
+            )
+            activeAudioProfile = null
+            activeAudioStartedAt = 0L
+            return
+        }
         val lived = if (startedAt > 0) android.os.SystemClock.uptimeMillis() - startedAt else -1L
         // 本轮记忆很快失效：下次连接重新按最新记忆选档
         activeAudioProfile = null
@@ -2225,6 +2445,9 @@ object SessionController {
                             // 0x5001 NowPlayingUpdate 的数据源：优先系统媒体会话，兜底 CarLife
                             // 0x10035。读不到（null）时虚拟链路自动退化为空态。
                             created.nowPlayingSource = { buildNowPlaying() }
+                            // 0x4155 CallStateUpdate 的数据源：车机订阅通话状态时按真实值应答，
+                            // 否则它认定这台手机永远不打电话，通话时不切音频通路。
+                            created.callStateSource = { callStateOf() }
                         }
                     retireSession()
                     // 会话静默降噪（2026-10-10）：从交接点起暂停其它接收端的出站连接探测
