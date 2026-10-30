@@ -149,6 +149,10 @@ object SessionController {
     fun ensure(context: Context) {
         appContext = context.applicationContext
         ensureSessionObjects(context.applicationContext)
+        // 车机在配对 / 首次 SDP 查询时就会缓存手机的 UUID 清单；App 一打开就先发布
+        // CarPlay 身份探针，避免「配对完成后再发布、车机不再查」的时序死角。
+        // 权限未授予时静默跳过，授权回调会再调一次。
+        startSdpProbe()
         // 横屏兼容写入失败的原因（user build 限制 / shell 无权限）只有这里能落盘：
         // 车机侧设置面板的 toast 只给用户看，排查需要日志。
         AppOrientationCompat.diagSink = ::appendLog
@@ -685,10 +689,24 @@ object SessionController {
         }
     }
 
+    /**
+     * 发布 CarPlay 身份探针 SDP 记录（幂等；权限未授予时静默跳过）。
+     *
+     * 由 Activity onCreate（[ensure]）与蓝牙授权回调调用。Aptiv/GWM V3 车机只认
+     * `2d8d2466-…-291a` 这个探针 UUID 来判定「无线 CarPlay 设备」，且通常在配对 /
+     * 首次 SDP 查询时缓存——所以要在配对前就把记录挂出来。
+     */
+    fun startSdpProbe() {
+        val server = bluetoothServer ?: return
+        if (server.hasPermission()) server.startProbeRecord()
+    }
+
     /** 状态行文本（Activity 渲染 statusText 用）。 */
     fun statusLine(): String =
         "wifi=${wifiConnector?.currentNetwork != null} " +
-            "bt=${bluetoothServer?.isRunning == true} ctrl=${(ctrlAdvertiser?.port ?: -1) > 0}"
+            "bt=${bluetoothServer?.isRunning == true} " +
+            "probe=${bluetoothServer?.isProbePublished == true} " +
+            "ctrl=${(ctrlAdvertiser?.port ?: -1) > 0}"
 
     /** 会话是否活跃（推出流进程或 BT 任一在跑）。 */
     fun isSessionRunning(): Boolean =

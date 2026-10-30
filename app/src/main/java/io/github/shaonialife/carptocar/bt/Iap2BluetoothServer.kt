@@ -44,12 +44,32 @@ class Iap2BluetoothServer(
          * iPhone 的 iAP2 服务 UUID（Oligo Security 公布；与 xcertplay
          * CarPlayController.IAP2_IPHONE_UUID 一致）。配件端是 …decacaff。
          */
-        val IPHONE_IAP2_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
-        private const val SDP_NAME = "iAP2"
+        val IPHONE_IAP2_UUID: UUID = CarPlaySdp.IPHONE_IAP2_UUID
+
+        /**
+         * Aptiv/GWM V3 车机（坦克 300 等同平台）判定「无线 CarPlay 设备」用的探针 UUID。
+         * 见 [CarPlaySdp] 与 `docs/tank300-gwm-aptiv-compatibility.md`。
+         */
+        val IDENTITY_PROBE_UUID: UUID = CarPlaySdp.IDENTITY_PROBE_UUID
+
+        private const val SDP_NAME = CarPlaySdp.IAP2_SDP_NAME
+        private const val PROBE_SDP_NAME = CarPlaySdp.IDENTITY_PROBE_NAME
         private const val SESSION_TIMEOUT_MILLIS = 60_000L
     }
 
     private var serverSocket: AtomicReference<BluetoothServerSocket?> = AtomicReference(null)
+
+    /**
+     * 「CarPlay 身份探针」的 SDP 监听。它只负责让手机 SDP 里出现
+     * [IDENTITY_PROBE_UUID]，不承载协议：车机连进来就立即关掉。
+     */
+    private var probeSocket: BluetoothServerSocket? = null
+
+    @Volatile
+    private var probePublished = false
+
+    /** 探针记录是否已发布（日志/诊断用）。 */
+    val isProbePublished: Boolean get() = probePublished
 
     @Volatile
     private var activeChannel: Iap2LinkChannel? = null
@@ -72,6 +92,92 @@ class Iap2BluetoothServer(
         ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
             PackageManager.PERMISSION_GRANTED
 
+    /**
+     * 发布「CarPlay 身份探针」SDP 记录（幂等，可重复调用）。
+     *
+     * Aptiv/GWM V3 车机（坦克 300 等同平台）在
+     * `AptivBluetoothConnectionManagerService.isCPSupportedOverWiFi()` 里**只查**
+     * [IDENTITY_PROBE_UUID]。只监听 …cafe 时它不会把本机归到无线 CarPlay 设备，
+     * `PhoneProjectionService` 也就不会发起无线会话。探针本身不承载协议：
+     * 车机若连进来立即关闭，SDP 记录留在蓝牙栈里供查询。
+     *
+     * 越早发布越好——车机在配对 / 首次 SDP 查询时就会缓存这份 UUID 清单；
+     * 配对完成后再发布，车机可能直到重新配对都不会再查。
+     */
+    @SuppressLint("MissingPermission")
+    fun startProbeRecord(): Boolean {
+        synchronized(this) {
+            if (probeSocket != null) return true
+        }
+        if (!hasPermission()) {
+            log("BT: 缺少 BLUETOOTH_CONNECT 权限——CarPlay 身份探针未发布")
+            return false
+        }
+        val adapter =
+            try {
+                context.getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
+            } catch (_: Exception) {
+                null
+            }
+        if (adapter == null || !adapter.isEnabled) {
+            log("BT: 蓝牙不可用或未开启——CarPlay 身份探针未发布")
+            return false
+        }
+        synchronized(this) {
+            if (probeSocket != null) return true
+            return try {
+                val socket =
+                    adapter.listenUsingRfcommWithServiceRecord(
+                        PROBE_SDP_NAME,
+                        IDENTITY_PROBE_UUID,
+                    )
+                probeSocket = socket
+                probePublished = true
+                log(
+                    "BT: CarPlay 身份探针 SDP 已发布（$IDENTITY_PROBE_UUID）——" +
+                        "Aptiv/GWM 车机据此把本机识别为无线 CarPlay 设备",
+                )
+                Thread(::probeAcceptLoop, "carplay-sdp-probe").apply {
+                    isDaemon = true
+                    start()
+                }
+                true
+            } catch (error: IOException) {
+                log("BT: CarPlay 身份探针发布失败 - ${error.message}")
+                false
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun probeAcceptLoop() {
+        while (true) {
+            val socket = synchronized(this) { probeSocket } ?: break
+            try {
+                val accepted = socket.accept()
+                log("BT: 车机连入 CarPlay 身份探针（仅 SDP 识别，立即关闭连接）")
+                runCatching { accepted.close() }
+            } catch (error: IOException) {
+                if (synchronized(this) { probeSocket } != null) {
+                    log("BT: CarPlay 身份探针 accept 结束 - ${error.message}")
+                }
+                break
+            }
+        }
+    }
+
+    private fun stopProbeRecord() {
+        val socket =
+            synchronized(this) {
+                val current = probeSocket
+                probeSocket = null
+                probePublished = false
+                current
+            } ?: return
+        runCatching { socket.close() }
+        log("BT: CarPlay 身份探针 SDP 已撤下")
+    }
+
     fun start(): Boolean {
         if (running) return true
         if (!hasPermission()) {
@@ -88,12 +194,14 @@ class Iap2BluetoothServer(
             log("BT: 蓝牙不可用或未开启")
             return false
         }
+        // 探针先于 iAP2 监听发布：车机可能在看到 …cafe 之前就先查无线 CarPlay 能力。
+        startProbeRecord()
         return try {
             serverSocket.set(
                 adapter.listenUsingRfcommWithServiceRecord(SDP_NAME, IPHONE_IAP2_UUID),
             )
             running = true
-            log("BT: 监听 $SDP_NAME，等待接收端回连…")
+            log("BT: 监听 iAP2 服务与 CarPlay 身份探针，等待接收端回连…")
             Thread(::acceptLoop, "iap2-bt-accept").apply {
                 isDaemon = true
                 start()
@@ -205,6 +313,7 @@ class Iap2BluetoothServer(
     fun stop() {
         running = false
         serverSocket.getAndSet(null)?.let { runCatching { it.close() } }
+        stopProbeRecord()
         log("BT: 监听已停止")
     }
 }

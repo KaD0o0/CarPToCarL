@@ -45,7 +45,7 @@
 | 包名   | `io.github.shaonialife.carptocar`                                             |
 | 应用名  | **CarPToCarL**（不含任何第三方商标）                                                     |
 | 最低系统 | Android 12（minSdk 31，targetSdk 34）                                            |
-| 适用车型 | 支持**无线 CarPlay** 的车机（真车已验证：奥迪 MIB3；测试台：DiPlay / xcertplay）                    |
+| 适用车型 | 支持**无线 CarPlay** 的车机（真车已验证：奥迪 MIB3；测试台：DiPlay / xcertplay；GWM V3 / 坦克 300 已按 OTA 画像补齐 SDP 探针，待实车验证） |
 | 画面来源 | 本机 **CarLife+** 引擎（荣耀：`com.baidu.carlife.honor` 8.8.5）                        |
 | 音频   | PCM 直通（CarLife 音频通道 → AirPlay 音频通道）                                           |
 | 前身 / 参考项目 | **[CarDeck](https://github.com/shaonialife/cardeck)**（同作者的上一代项目，MIT）——本项目的协议层与工程骨架源自它 |
@@ -68,6 +68,23 @@
 
 两个仓库都未声明或使用任何第三方的 MFi 授权，法律边界见
 [docs/LEGAL-NOTES.md](docs/LEGAL-NOTES.md)。
+
+### 车机适配：坦克 300 / GWM V3（Aptiv）
+
+坦克 300 的 GWM V3 OTA 里，Aptiv 车机栈的无线 CarPlay 是强制开启的；但它的
+`AptivBluetoothConnectionManagerService.isCPSupportedOverWiFi()` **只认 SDP 里一条
+`2d8d2466-…-291a` 的 CarPlay 身份探针**，不是只认 `…cafe`。只监听 `…cafe` 会被车机
+归到「仅 iAP2/有线」，不会进 `CARPLAY_WIRELESS`。本版在 App 打开、蓝牙授权、启动连接
+三个时点自动发布这条探针（`bt/CarPlaySdp.kt` + `Iap2BluetoothServer.startProbeRecord()`）。
+
+**配对前请先打开 App（状态行 `probe=true`），再在车机上配对/选择本机**；车机在配对时
+缓存 SDP UUID，配对后再发布可能不会被重新查询。
+
+坦克 300 的 `0x1D01` 只声明 `0x5703`（没有 `0x4301`），且 `0x5702` 后需要先拿到
+`0x4E0E` 传输标识。本版在 `0x5702` 后紧跟 `0x4E0E`、无应答再补一次；仍无时会保持
+蓝牙保活并每 15 秒重试，晚到的 `0x5703` 也会被解析交给主控（不再每 ~30 秒拆链）。
+OEM 侧证据、车机 adb 命令、实车日志判读与剩余风险见
+[docs/tank300-gwm-aptiv-compatibility.md](docs/tank300-gwm-aptiv-compatibility.md)。
 
 ### 方向说明
 

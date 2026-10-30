@@ -178,6 +178,10 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             log("BLUETOOTH_CONNECT 授权: $granted")
+            if (granted) {
+                // 授权后立刻补发 CarPlay 身份探针：Aptiv/GWM 车机在配对/SDP 查询时就要看到它。
+                SessionController.startSdpProbe()
+            }
             if (granted && pendingStartAfterBtPermission.compareAndSet(true, false)) {
                 proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
             }

@@ -153,6 +153,60 @@ class Iap2SenderSessionTest {
     }
 
     /**
+     * 坦克 300（GWM/Aptiv）形态：车机声明会发 0x5703，但首轮/重试窗口内都不回。
+     * 旧实现会抛 IOException 拆链重连（每 ~30s 一轮，车机热点启动反复归零）；
+     * 新实现保持蓝牙链路，保活泵补 0x4e0e + 0x5702，晚到 0x5703 经
+     * onEndpointUpdate 交给主控走 WiFi/ctrl 流程。
+     */
+    @Test
+    fun legacyCarWithoutWifiKeepsLinkForLateWifiConfiguration() {
+        val pair = InMemoryStreamPair()
+        val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
+        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+        val accessory = MockAccessory(accessoryChannel, audiDeclarations = true, lateWifi = true)
+
+        val accessoryThread = Thread({ accessory.run() }, "mock-accessory-late-wifi")
+        accessoryThread.isDaemon = true
+        accessoryThread.start()
+
+        val updates = AtomicReference<Iap2SenderSession.CarPlayEndpoint?>()
+        val updateLatch = CountDownLatch(1)
+        val session =
+            Iap2SenderSession(
+                phoneChannel,
+                log = { line -> println("PHONE $line") },
+                bluetoothMac = "AA:BB:CC:DD:EE:FF",
+                deviceName = "test-device",
+                onEndpointUpdate = {
+                    updates.set(it)
+                    updateLatch.countDown()
+                },
+            )
+
+        val phaseOne = session.run(timeoutMillis = 10_000L)
+        // 两轮 0x5702 都没回，但车机声明会发 0x5703 → 不拆链，先返回空端点
+        assertEquals("", phaseOne.ssid)
+
+        val pump = Thread({ session.pumpIncomingForever() }, "phone-pump-late-wifi")
+        pump.isDaemon = true
+        pump.start()
+        // Phase 1 已结束，放行车机补发晚到的 0x5703
+        accessory.lateWifiGate.countDown()
+
+        assertTrue("晚到 0x5703 未在 10s 内经 onEndpointUpdate 回调", updateLatch.await(10, TimeUnit.SECONDS))
+        val late = updates.get()
+        assertNotNull(late)
+        assertEquals("MockAP", late!!.ssid)
+        assertEquals("secret-passphrase", late.passphrase)
+        assertEquals(2, late.securityType)
+        assertEquals(36, late.channel)
+
+        phoneChannel.close()
+        accessoryChannel.close()
+        pump.join(2_000)
+    }
+
+    /**
      * Audi MMI 0000 形态：0x4301 的地址字段按定长 NUL 填充（IPv6 后 22 个、IPv4 后 5 个）。
      * 旧实现只去掉**一个**尾部 NUL，得到 `"10.174.189.1\0\0\0\0\0"`——它 contains('.')=true、
      * contains(':')=false，能骗过所有「是不是 IPv4」的判断，但 Android 的 getaddrinfo 解不了，
@@ -208,7 +262,14 @@ class Iap2SenderSessionTest {
          * 且应等到 Phase 1 结束（保活期）才补发 0x4301。
          */
         private val newProtocol: Boolean = false,
+        /**
+         * 坦克 300 形态：声明会发 0x5703，但首轮/重试窗口内都不发；
+         * 等测试放行后再补发（验证「不拆链、晚到 0x5703 能交给主控」）。
+         */
+        private val lateWifi: Boolean = false,
     ) {
+        val lateWifiGate = CountDownLatch(1)
+
         private val parser = Iap2Csm.Parser()
         private val pending = ArrayDeque<Iap2Csm.Frame>()
 
@@ -283,18 +344,29 @@ class Iap2SenderSessionTest {
             send(Iap2MessageIds.START_NOW_PLAYING_UPDATES)
             // GM/Cinemo 形态：没有凭据可发（0x4301 才是唯一来源）
             if (!newProtocol) {
-                send(
-                    Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION,
-                    Iap2Csm.string(1, "MockAP"),
-                    Iap2Csm.string(2, "secret-passphrase"),
-                    Iap2Csm.u8(3, 2),
-                    Iap2Csm.u8(4, 36),
-                )
+                if (lateWifi) {
+                    // 坦克 300：0x5702 后紧跟 0x4E0E；首轮 1s 无应答后发送端再补
+                    // 0x4E0E + 0x5702。这里两轮都只消费、不回 0x5703。
+                    expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
+                    expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
+                    expect(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
+                } else {
+                    send(
+                        Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION,
+                        Iap2Csm.string(1, "MockAP"),
+                        Iap2Csm.string(2, "secret-passphrase"),
+                        Iap2Csm.u8(3, 2),
+                        Iap2Csm.u8(4, 36),
+                    )
+                    // 坦克 300 形态：发送端在 0x5702 之后紧跟一次 0x4E0E（传输标识），
+                    // 车机据此回 0x5703；随后 0x4301 之后还会再发一次（幂等）。
+                    expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
+                }
             }
 
             // CarPlay 启动（问候已在 0xAA05 之后收过，此处不再重复期望）
             expect(Iap2MessageIds.CARPLAY_AVAILABILITY)
-            if (!lateStartSession) {
+            if (!lateStartSession && !lateWifi) {
                 sendStartSession()
             }
 
@@ -308,7 +380,17 @@ class Iap2SenderSessionTest {
                 sendStartSession()
             } else {
                 expect(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)
-                if (lateStartSession) {
+                if (lateWifi) {
+                    // 首轮/重试窗口都故意不回 0x5703；等测试确认 Phase 1 已返回空端点后补发。
+                    check(lateWifiGate.await(5, TimeUnit.SECONDS)) { "lateWifiGate 未放行" }
+                    send(
+                        Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION,
+                        Iap2Csm.string(1, "MockAP"),
+                        Iap2Csm.string(2, "secret-passphrase"),
+                        Iap2Csm.u8(3, 2),
+                        Iap2Csm.u8(4, 36),
+                    )
+                } else if (lateStartSession) {
                     // 车机打开 CarPlay 窗口后补发（Phase 1 早已结束）
                     Thread.sleep(150)
                     sendStartSession()
