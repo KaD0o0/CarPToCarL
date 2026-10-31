@@ -190,6 +190,40 @@ class VirtualIap2LinkTest {
         assertTrue("出站绝不能落到事件通道", h.eventSent.isEmpty())
     }
 
+    /**
+     * 坦克 300 / GWM：车机只发一个 SYN marker，随后 ~0.5s 关闭蓝牙 iAP2 链路。
+     * 旧逻辑等第二个 marker 才回协商 → 虚拟链路永远到不了 NORMAL，AirPlay 会话
+     * 约 2s 后整链 reset（2026-10-31 实车日志）。本用例锁住「单 marker 250ms 兜底」。
+     */
+    @Test
+    fun singleMarkerGetsControlRoundAfterFallbackWindow() {
+        val h = Harness()
+        h.link.armMib3()
+        val detect = h.controlSent.size
+        h.link.onCarBytes(Iap2LinkEngine.MARKER)
+        assertEquals("首个 marker 不应立即发字节（保留 MIB3 探测重发的余地）", detect, h.controlSent.size)
+
+        h.clock += 100
+        h.link.tick()
+        assertEquals("未到兜底窗口不应发协商字节", detect, h.controlSent.size)
+
+        h.clock += 200
+        h.link.tick()
+        val sent = h.controlSent.drop(detect)
+        assertTrue("单 marker 兜底后必须补发协商字节", sent.isNotEmpty())
+        val payload = sent.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
+        assertTrue(
+            "补发的第一批必须含 marker（FF 55）",
+            payload.size >= 12 && payload[0] == 0xFF.toByte() && payload[1] == 0x55.toByte(),
+        )
+        assertTrue(
+            "marker 之后必须紧跟 FF5A 会话表",
+            payload[6] == 0xFF.toByte() && payload[7] == 0x5A.toByte(),
+        )
+        assertTrue("会话表必须带 SYN 位（0x80）", (payload[10].toInt() and 0x80) != 0)
+        assertTrue("兜底出站仍只能走控制通道", h.eventSent.isEmpty())
+    }
+
     @Test
     fun fullMib3HandshakeWithBurstAndSubscriptions() {
         val h = Harness()

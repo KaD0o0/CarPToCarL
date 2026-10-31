@@ -556,8 +556,9 @@ class Iap2SenderSession(
                         // 若长期无回，大概率是车机缓存的 SDP 里没有 2d8d2466 探针 UUID。
                         log(
                             "iap2 车机声明会发 0x5703 但两轮 0x5702 均无应答——不拆链，保持蓝牙保活；" +
-                                "保活泵将继续补 0x4e0e + 0x5702。若长期无回，请在车机上删除本机配对后重新配对" +
-                                "（车机缓存的 SDP 里可能没有 2d8d2466 探针 UUID）",
+                                "保活泵将继续补 0x4e0e + 0x5702。车机热点可能未开/处于 SUSPEND 或 " +
+                                "LOCAL_INFOTAINMENT：请启动车辆到 FULL_OPERATION、在车机上打开 Wi-Fi 热点，" +
+                                "或删除本机配对后重配（车机缓存的 SDP 里可能没有 2d8d2466 探针 UUID）",
                         )
                         awaitingLegacyWifi = true
                         CarPlayEndpoint(
@@ -603,8 +604,30 @@ class Iap2SenderSession(
 
         // 真机顺序：0x4301 之后回 0x4E0E（传输标识确认）。
         // 部分车机（坦克 300）在 0x5702 之后就要它；两处都发，幂等且发后不管。
-        sendTransportIdentifier()
-        log("iap2 0x4e0e/0x4300 —— Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点")
+        //
+        // 坦克 300 实测：车机在没下发 0x5703 时会在 ~7s 主动关掉 BT；这条 0x4E0E
+        // 正好撞上 socket closed。不要让它把整轮会话抛掉——旧协议车机已声明会发
+        // 0x5703，保留空端点返回主控，让主控进入「等手机手动加入车机热点」的观察者；
+        // 只要车机 AP 已经开着，用户手动连上热点后仍可走 ctrl/mDNS 接 AirPlay。
+        val transportSendFailed =
+            try {
+                sendTransportIdentifier()
+                false
+            } catch (error: IOException) {
+                log("iap2 发送 0x4e0e 时链路已关闭：${error.message}")
+                true
+            }
+        if (transportSendFailed) {
+            if (!awaitingLegacyWifi) {
+                throw IOException("iAP2 链路在发送 0x4e0e 时关闭")
+            }
+            log(
+                "iap2 车机在未下发 0x5703 时关闭 BT——保留空端点返回主控；" +
+                    "若车机热点已开，请手机 WLAN 手动加入车机热点后点「继续等待」",
+            )
+        } else {
+            log("iap2 0x4e0e/0x4300 —— Phase 1 完成：拿到热点凭据与（可能的）AirPlay 端点")
+        }
 
         // 后续（Phase 2）：加入热点 → mDNS 解析 _airplay._tcp → AirPlay 主会话。
         // 0x5703 缺席时 AP 信息来自 0x4301（已并入 endpoint）——保活期车机重发

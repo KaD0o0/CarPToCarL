@@ -385,8 +385,14 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * 应用专属网络（WifiNetworkSpecifier）在 Android 12/12L 需要位置权限与位置服务；
-     * 13+ 由 NEARBY_WIFI_DEVICES 接管、不再要求定位。缺权限时系统会直接
-     * `requestNetwork` 失败（表现为「未能加入车机热点」，很难自查），因此前置拦截。
+     * 13+ 发起连接由 NEARBY_WIFI_DEVICES 接管，但 **读取当前 SSID / WiFi 扫描结果**
+     * 在 Samsung Android 16 上仍要求 ACCESS_FINE_LOCATION，否则
+     * `WifiManager.getConnectionInfo().SSID` 会被脱敏成 `<unknown ssid>`、扫描结果为空。
+     *
+     * 2026-10-31 坦克 300 实测：手机一直连在车机热点 `坦克 300ypyjllj`，但 App 只申请了
+     * NEARBY_WIFI_DEVICES，位置权限被拒；`cmd wifi status` 无 shell 权限又失败，于是
+     * 等待观察者永远看不到 SSID，日志一直写「已开但未连接任何网络」。这里把两项都在
+     * 13+ 前置申请，并在 [shellWifiStatus] 增加 WifiManager 兜底查询。
      */
     private fun ensureWifiLocationReady(onReady: () -> Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -396,21 +402,21 @@ class MainActivity : AppCompatActivity() {
             // 静默挂起：既不回调 onAvailable 也不回调 onUnavailable，也不抛异常。
             // 2026-10-29 BMW iD9 日志里连续 8 轮「发起加入后一条日志都没有」
             // 就是这个形态，必须在这里前置拦截。
-            val granted =
+            val nearbyGranted =
                 ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) ==
                     PackageManager.PERMISSION_GRANTED
-            if (!granted) {
+            if (!nearbyGranted) {
                 pendingStartAfterLocationPermission.set(true)
                 nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
                 return
             }
-            onReady()
-            return
         }
-        val granted =
+        // 12/12L 与 13+ 读取 SSID/扫描都要 FINE；13+ 的 NEARBY 与 FINE 是两套权限，
+        // 不能因为 NEARBY 已授予就跳过位置权限（Samsung 实测会脱敏）。
+        val fineGranted =
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
                 PackageManager.PERMISSION_GRANTED
-        if (!granted) {
+        if (!fineGranted) {
             pendingStartAfterLocationPermission.set(true)
             locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
             return
@@ -448,7 +454,7 @@ class MainActivity : AppCompatActivity() {
         onReady()
     }
 
-    /** 位置权限授权后自动继续启动连接（仅 Android 12/12L）。 */
+    /** 位置/附近 WiFi 权限授权后自动继续启动连接。 */
     private val pendingStartAfterLocationPermission =
         java.util.concurrent.atomic
             .AtomicBoolean(false)
@@ -456,8 +462,12 @@ class MainActivity : AppCompatActivity() {
     private val locationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             log("ACCESS_FINE_LOCATION 授权: $granted")
-            if (granted && pendingStartAfterLocationPermission.compareAndSet(true, false)) {
-                proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
+            if (granted) {
+                pendingStartAfterLocationPermission.set(false)
+                // 重新走完整检查：13+ 可能还需要 NEARBY，或位置服务未开。
+                ensureWifiLocationReady {
+                    proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
+                }
             }
         }
 
@@ -468,8 +478,13 @@ class MainActivity : AppCompatActivity() {
                 "NEARBY_WIFI_DEVICES 授权: $granted" +
                     if (granted) "" else "——无法加入车机热点，请到「设置 > 应用 > 权限 > 附近的设备」授予",
             )
-            if (granted && pendingStartAfterLocationPermission.compareAndSet(true, false)) {
-                proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
+            if (granted) {
+                pendingStartAfterLocationPermission.set(false)
+                // 13+ 只授予 NEARBY 还不够：读取 SSID/扫描还需要 FINE，
+                // 这里继续走完整检查，缺 FINE 时会接着弹位置权限。
+                ensureWifiLocationReady {
+                    proceedToConnect { ensureBluetoothReady { startConnectionNow() } }
+                }
             }
         }
 

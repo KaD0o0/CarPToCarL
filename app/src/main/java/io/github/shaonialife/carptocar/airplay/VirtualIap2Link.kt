@@ -89,6 +89,16 @@ class VirtualIap2Link(
     private var mib3AuthStage = 0
     private var mib3MarkerIgnores = 0
     private var mib3DeferredLogs = 0
+
+    /**
+     * 首个 MIB3/事件通道 SYN marker 的到达时刻（毫秒）。
+     *
+     * 坦克 300 实测：车机只发一个 SYN marker，随后 ~0.5s 就关蓝牙 iAP2 链路；
+     * 若还等第二个 marker 才回协商，虚拟链路永远到不了 NORMAL，车机的 AirPlay
+     * 会话会在 ~2s 后整链 reset。配 [MIB3_SINGLE_MARKER_FALLBACK_MS] 的单 marker
+     * 兜底，既保留「第二个 marker 立即升级」的旧路径，也不会让单车机等死。
+     */
+    private var mib3FirstMarkerAtMs = Long.MIN_VALUE
     private var mib3WirelessSessionId: String? = null
 
     /**
@@ -162,10 +172,7 @@ class VirtualIap2Link(
                     } catch (_: InterruptedException) {
                         return@Thread
                     }
-                    synchronized(lock) {
-                        engine.advanceTime(System.nanoTime() / 1_000_000L)
-                        drainLocked()
-                    }
+                    tick()
                 }
             },
             "iap-link-pacer",
@@ -181,6 +188,20 @@ class VirtualIap2Link(
             if (started) return
             started = true
             engine.enterNegotiating()
+        }
+    }
+
+    /**
+     * 节拍线程一次 tick（真实周期 200ms）。
+     *
+     * 单独抽出来是为了让单测能确定性地驱动「单 marker 兜底」——真实运行时由
+     * [init] 里的 `iap-link-pacer` 线程调用，测试里 `alive=false` 关闭线程后手动 tick。
+     */
+    internal fun tick() {
+        synchronized(lock) {
+            engine.advanceTime(nowMillis())
+            drainLocked()
+            maybeRespondToSingleMib3MarkerLocked()
         }
     }
 
@@ -257,12 +278,36 @@ class VirtualIap2Link(
         val now = nowMillis()
         controlSynRounds++
         controlSynRoundStartedAtMs = now
+        mib3FirstMarkerAtMs = Long.MIN_VALUE
         engine.initiate(now)
         log(
             "IAPLINK: 控制通道 marker + 本表同步包（第 $controlSynRounds/$MAX_CONTROL_SYN_ROUNDS 轮，$reason）" +
                 "——等车机同步包（FF5A）",
         )
         drainLocked()
+    }
+
+    /**
+     * 单 marker 兜底：坦克 300 / GWM 车机只发一个 SYN marker，随后约 0.5s 关闭蓝牙
+     * iAP2 链路；等第二个 marker 会错过窗口，虚拟链路停在 NEGOTIATING，车机的
+     * AirPlay 会话约 2s 后整链 reset（2026-10-31 实车日志）。
+     *
+     * 由 200ms 节拍线程调用：首个 marker 后 [MIB3_SINGLE_MARKER_FALLBACK_MS] 内没有
+     * 第二个，就按「单次 SYN」升级为控制通道协商。第二个 marker 到达时旧路径仍会
+     * 立即升级（[onCarBytes]），不受影响。
+     */
+    private fun maybeRespondToSingleMib3MarkerLocked() {
+        if (!mib3Armed || eventLinkArmed || mib3MarkerIgnores < 1) return
+        val first = mib3FirstMarkerAtMs
+        if (first == Long.MIN_VALUE) return
+        val now = nowMillis()
+        if (now - first < MIB3_SINGLE_MARKER_FALLBACK_MS) return
+        eventLinkArmed = true
+        log(
+            "IAPLINK: 首个车机 marker 后 ${now - first}ms 无第二个——" +
+                "按单次 SYN 兜底回协商（车机只发一次 marker 时不再死等）",
+        )
+        startControlRoundLocked("首个 marker 超时兜底")
     }
 
     /** 车机链路字节入口（事件通道 iAPSendMessage 的 data）。 */
@@ -315,7 +360,11 @@ class VirtualIap2Link(
                         }
                         return
                     } else if (mib3MarkerIgnores <= 3) {
-                        log("IAPLINK: 车机 marker（#$mib3MarkerIgnores）——凑够 $EVENT_LINK_MARKER_THRESHOLD 个后补发协商")
+                        if (mib3FirstMarkerAtMs == Long.MIN_VALUE) mib3FirstMarkerAtMs = now
+                        log(
+                            "IAPLINK: 车机 marker（#$mib3MarkerIgnores）——" +
+                                "${MIB3_SINGLE_MARKER_FALLBACK_MS}ms 内无第二个则按单 marker 兜底回协商",
+                        )
                     }
                 } else {
                     // 布防前（屏幕 SETUP 未完成）：不回应——真机在 SETUP 前不 detect，
@@ -931,6 +980,13 @@ class VirtualIap2Link(
          * 取 2 既能避开 MIB3 的一次探测重发，又不会让车机白等太久。
          */
         const val EVENT_LINK_MARKER_THRESHOLD = 2
+
+        /**
+         * 单 marker 兜底窗口（毫秒）：首个车机 SYN marker 后等这么久，仍没有第二个
+         * 就主动升级为控制通道协商。坦克 300 / GWM 车机只发一次 marker，且 ~0.5s
+         * 后就关蓝牙 iAP2 链路；250ms 留出一次探测重发的余地，又能在关链前发出协商。
+         */
+        const val MIB3_SINGLE_MARKER_FALLBACK_MS = 250L
 
         /**
          * 控制通道协商：每轮多久无进展就重开下一轮，最多几轮。

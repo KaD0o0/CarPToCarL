@@ -30,3 +30,7 @@ dist/
 # 本地临时抓取/调试产物（不进版本库）
 .tmp/
 .git-rewrite/
+
+# 实车日志导出（App 导出的全量日志：体积大、含本机 SSID/地址，按需单独评审后再入册）
+CarPToCarL-log-*.txt
+*-log-*-all.txt

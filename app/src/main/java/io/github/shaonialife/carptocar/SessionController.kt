@@ -1366,14 +1366,29 @@ object SessionController {
      * WiFi 开关与当前连接的 SSID（一次 `cmd wifi status` 查询）。
      * 输出形如：`Wifi is enabled` + `Wifi is connected to "Redmi K40"`（未连接无此行）。
      */
+    @Suppress("DEPRECATION")
     private fun shellWifiStatus(): Pair<Boolean, String?> {
         val result =
             SysShell
                 .exec("cmd wifi status", 5_000L)
-        if (!result.ok) return true to null
-        val enabled = !result.output.contains("Wifi is disabled")
-        val ssid = Regex("connected to \"(.*)\"").find(result.output)?.groupValues?.get(1)
-        return enabled to ssid
+        if (result.ok) {
+            val enabled = !result.output.contains("Wifi is disabled")
+            val ssid = Regex("connected to \"(.*)\"").find(result.output)?.groupValues?.get(1)
+            return enabled to ssid
+        }
+        // Shizuku 已移除后 `cmd wifi status` 没有 shell 特权，exec 必然失败；
+        // 旧实现直接返回 `true to null`，于是手机明明连在车机热点上，等待观察者
+        // 也永远看不到 SSID（2026-10-31 坦克 300：手机已连 坦克 300ypyjllj，
+        // 日志仍是「Wi-Fi=已开但未连接任何网络」）。这里退回 WifiManager 查询。
+        // 注意：Samsung/Android 13+ 上 getConnectionInfo().SSID 仍要求
+        // ACCESS_FINE_LOCATION，否则会被脱敏成 <unknown ssid>；MainActivity 已
+        // 同时申请 NEARBY_WIFI_DEVICES 与位置权限。
+        val wifi =
+            appContext?.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                ?: return true to null
+        val raw = wifi.connectionInfo?.ssid?.trim('"')
+        val ssid = raw?.takeUnless { it.isEmpty() || it == "<unknown ssid>" }
+        return wifi.isWifiEnabled to ssid
     }
 
     private fun shellWifiDisabled(): Boolean = !shellWifiStatus().first
@@ -1414,9 +1429,9 @@ object SessionController {
             }
             // 英雄卡副标题同步：否则界面一直显示默认的「蓝牙 iAP2 握手 → …」，
             // 用户看到的是「一直在握手」，实际早已连上、在等车机下发凭据。
-            phaseHint = "已连上车机，正在等它下发热点信息（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· 请保持 Wi-Fi 开启"
+            phaseHint = "已连上车机，正在等它下发热点信息（0x5703/0x4301，最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· 请保持 Wi-Fi 开启"
             appendLog(
-                ">>> [$source] 进入保活等待：车机声明会发 0x4301 但窗口内未到。" +
+                ">>> [$source] 进入保活等待：车机声明会发 0x5703/0x4301 但窗口内未到。" +
                     "蓝牙链路保持（最多 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟，从点「启动连接」算起），" +
                     "期间请保持手机 Wi-Fi 开启；车机多数要看到手机进入它自己的网络后才会下发凭据",
             )
@@ -1438,7 +1453,7 @@ object SessionController {
                 if (tick % 6 == 0) {
                     val waited = (android.os.SystemClock.uptimeMillis() - watchStartedAt) / 1_000
                     appendLog(
-                        ">>> [$source] 仍在等 0x4301（已等 ${waited}s · 上限 " +
+                        ">>> [$source] 仍在等 0x5703/0x4301（已等 ${waited}s · 上限 " +
                             "${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟）· Wi-Fi=" +
                             when {
                                 !wifiEnabled -> "已关闭（请打开——车机看不到手机就不会下发凭据）"
@@ -1447,9 +1462,35 @@ object SessionController {
                             },
                     )
                 }
+                // 第 1 次和之后每 30s 扫一次候选车机热点：没有车机 adb 时，
+                // 这是判断「车机 AP 到底有没有起来」的唯一手机侧证据。系统对
+                // startScan 有 2 分钟 4 次的节流，30s 一次不会触发限制。
+                var carHotspots: List<String> = emptyList()
+                if (tick == 1 || tick % 6 == 0) {
+                    carHotspots = scanCarHotspots()
+                    if (carHotspots.isEmpty()) {
+                        phaseHint = "未发现车机热点——请打开车机 WiFi 热点/重启车机（0x5703 未下发）"
+                    }
+                    appendLog(
+                        ">>> [$source] 车机热点扫描：" +
+                            if (carHotspots.isEmpty()) {
+                                "未发现（坦克/GWM/CarPlay/P01）——车机 AP 没广播，先查车机热点开关/电源态"
+                            } else {
+                                "发现候选 ${carHotspots.joinToString()}——可在系统 WLAN 手动加入"
+                            },
+                    )
+                }
                 val ssid = if (wifiEnabled) currentSsid else null
                 // 同一 SSID 只问一次（用户选「继续等待」后不再打扰）；换网络再问。
-                if (ssid.isNullOrEmpty() || promptedSsid == ssid) continue
+                if (ssid.isNullOrEmpty() || promptedSsid == ssid) {
+                    if (ssid.isNullOrEmpty() && carHotspots.isNotEmpty()) {
+                        appendLog(
+                            ">>> [$source] 候选车机热点已广播但手机未连接——请到系统 WLAN 手动加入" +
+                                "（密码在车机屏幕/设置里），加入后这里会自动检测并询问是否继续",
+                        )
+                    }
+                    continue
+                }
                 promptedSsid = ssid
                 val choice =
                     askWifiJoinChoice(
@@ -1481,6 +1522,50 @@ object SessionController {
                 // 等待预算耗尽 = 这一轮确定连不上：把内存里的报文快照落盘（独立文件）
                 SessionTrace.sessionEnd("等待 0x4301 超时（车机未下发热点信息），本轮放弃")
             }
+        }
+    }
+
+    /**
+     * 扫描广播中的候选车机热点。
+     *
+     * 坦克 300 的 AP 由车机 `com.aptiv.wifi` 的 `WifiService.startApSta()` 管理：
+     * `wifiAPPreference.apState=false` 或车机处于 SUSPEND/LOCAL_INFOTAINMENT 时，
+     * AP 根本不广播，蓝牙/iAP2 却照常工作——此时日志里不会出现 0x5703，手机侧
+     * 再发多少 0x5702/0x4E0E 也没用。这个扫描就是没有车机 adb 时的判定依据：
+     * 扫不到 `坦克 300xxxxxx` / `GWM_V3xxxx`，就应先查车机热点开关/电源态。
+     *
+     * 只读 SSID，不连网、不记录密码；失败（权限/节流）只落一行日志。
+     */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun scanCarHotspots(): List<String> {
+        val context = appContext ?: return emptyList()
+        val wifi =
+            context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+                ?: return emptyList()
+        return try {
+            wifi.startScan()
+            Thread.sleep(1_500)
+            val results = wifi.scanResults
+            val allSsids =
+                results
+                    .mapNotNull { result -> result.SSID?.trim('"')?.takeIf { it.isNotEmpty() } }
+                    .distinct()
+            // 区分「车机 AP 没广播」和「手机扫描被节流/没权限」：前者总数正常但
+            // 没有候选；后者总数是 0。没有这一行，日志里只有「未发现」，无法判断。
+            appendLog(
+                ">>> Wi-Fi 扫描原始结果：${allSsids.size} 个 SSID" +
+                    if (allSsids.isEmpty()) "（0 个：可能被系统节流或缺少位置/附近 WiFi 权限）" else "",
+            )
+            allSsids.filter { ssid ->
+                ssid.contains("坦克") ||
+                    ssid.contains("Tank", ignoreCase = true) ||
+                    ssid.contains("GWM", ignoreCase = true) ||
+                    ssid.contains("CarPlay", ignoreCase = true) ||
+                    ssid.contains("P01", ignoreCase = true)
+            }
+        } catch (error: Exception) {
+            appendLog(">>> 车机热点扫描失败：${error.message}")
+            emptyList()
         }
     }
 
